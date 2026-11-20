@@ -16,6 +16,12 @@ local sizing = false
 local next_size_check = 0
 local error_text = nil
 local opening = false
+-- 尺寸改为事件驱动：只有分屏/关窗/切焦点才重新量一次。
+local size_dirty = true
+-- 每个侧栏上次真正发出的签名，避免同一帧内容重复 set。
+local last_sig = {}
+-- 每个标签页里由本插件拉起的 omp 窗口，恢复新会话前先回收。
+local chat_panes = {}
 
 -- 转义传给终端 shell 的单个参数。
 local function shell_quote(value)
@@ -133,11 +139,22 @@ end
 
 -- 将当前列表同步到插件拥有的所有侧边栏。
 local function redraw(cx)
+	local base = #filtered
+		.. "|" .. query
+		.. "|" .. tostring(error_text)
+		.. "|" .. tostring(loading)
+		.. "|" .. tostring(rows[1] and rows[1].id)
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
 			sidebar_tabs[canvas.pane] = cx.session:tab_of(canvas.pane)
-			local main, dock = view(canvas.pane)
-			cx.canvas:set(canvas.pane, { view = main, dock = dock })
+			local state = pane_state(canvas.pane)
+			local sig = base .. "|" .. state.page .. "|" .. state.size
+			if last_sig[canvas.pane] ~= sig then
+				last_sig[canvas.pane] = sig
+				local main, dock = view(canvas.pane)
+				-- 超节点上限时 canvas:set 会抛错，别让一次失败打断整轮重绘。
+				pcall(cx.canvas.set, cx.canvas, canvas.pane, { view = main, dock = dock })
+			end
 		end
 	end
 end
@@ -162,7 +179,8 @@ local function update_sizes(cx)
 				for _, block in tab.blocks or {} do
 					if owned[block.id] and type(block.rows) == "number" and block.rows > 0 then
 						local state = pane_state(block.id)
-						local size = math.max(1, math.min(300, math.floor((block.rows - 5) / 3.4)))
+						-- 每张卡约 10 个节点，canvas 硬上限 2000 节点：300 行会直接超限。
+						local size = math.max(1, math.min(120, math.floor((block.rows - 5) / 3.4)))
 						if size ~= state.size then
 							local first = (state.page - 1) * state.size
 							state.page = math.floor(first / size) + 1
@@ -198,7 +216,6 @@ local function refresh(cx)
 		end
 		redraw(next_cx)
 	end)
-	redraw(cx)
 end
 
 -- 为当前标签页挂载侧边栏，已有面板时保留现有布局。
@@ -294,11 +311,23 @@ local function open_chat(cx, row, sidebar)
 	local tab = if origin then cx.session:tab_of(origin) else nil
 	local layout = if tab then cx.session:layout(tab) else nil
 	local target = if layout then rightmost(layout.root, sidebar) else nil
+	-- 同一标签页里上一个由本插件拉起的 omp 先关掉，避免叠加几百 MB。
+	if tab and chat_panes[tab] then
+		pcall(cx.layout.close, cx.layout, chat_panes[tab])
+		chat_panes[tab] = nil
+	end
 	local launch = { command = "omp --resume " .. shell_quote(row.path) }
 	if row.cwd ~= "" then launch.cwd = row.cwd end
-	if not target or not cx.layout:split(target, "right", launch) then
+	if not target then
 		cx:toast("error", "无法恢复会话", row.title)
+		return
 	end
+	local opened = cx.layout:split(target, "right", launch)
+	if not opened then
+		cx:toast("error", "无法恢复会话", row.title)
+		return
+	end
+	if tab then chat_panes[tab] = opened end
 end
 
 tern.on("canvas_action", function(ev, cx)
@@ -411,6 +440,7 @@ local function tick(cx)
 	-- 去重：同一 tab 只允许一个 OMP History canvas，多余的关掉。
 	local seen_tab = {}
 	local pane_tab = {}
+	local closed_any = false
 	for _, info in ipairs(cx.session:panes()) do pane_tab[info.pane] = info.tab end
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
@@ -420,7 +450,9 @@ local function tick(cx)
 				if seen_tab[tab] then
 					sidebar_tabs[canvas.pane] = nil
 					panes[canvas.pane] = nil
+					last_sig[canvas.pane] = nil
 					cx.layout:close(canvas.pane)
+					closed_any = true
 				else
 					seen_tab[tab] = canvas.pane
 				end
@@ -431,16 +463,27 @@ local function tick(cx)
 			end
 			if tab and count == 1 then
 				sidebar_tabs[canvas.pane] = nil
+				last_sig[canvas.pane] = nil
 				cx.layout:close(canvas.pane)
+				closed_any = true
 			end
 		end
 	end
-	ensure_sidebar(cx)
-	if tern.now() >= next_size_check then
-		next_size_check = tern.now() + 2000
+	-- 刚关掉的这一 tick 别立刻重开，否则形成每秒开关环。
+	if not closed_any then ensure_sidebar(cx) end
+	if size_dirty and tern.now() >= next_size_check then
+		size_dirty = false
+		next_size_check = tern.now() + 8000
 		update_sizes(cx)
 	end
 end
+
+-- 布局变化才需要重新量高度，不再靠每 2 秒轮询。
+local function mark_size_dirty() size_dirty = true end
+tern.on("pane_created", mark_size_dirty)
+tern.on("pane_closed", mark_size_dirty)
+tern.on("tab_created", mark_size_dirty)
+tern.on("focus", mark_size_dirty)
 
 -- 关闭整个标签时不改变其他标签的历史侧边栏显示状态。
 tern.on("tab_closed", function(ev)
@@ -453,6 +496,10 @@ tern.on("pane_closed", function(ev, cx)
 	local was_sidebar = sidebar_tabs[ev.pane] ~= nil
 	sidebar_tabs[ev.pane] = nil
 	panes[ev.pane] = nil
+	last_sig[ev.pane] = nil
+	for tab, pane in chat_panes do
+		if pane == ev.pane then chat_panes[tab] = nil end
+	end
 	if was_sidebar and tern.kv.get("visible") == true then
 		hide_sidebars(cx, ev.pane)
 	end

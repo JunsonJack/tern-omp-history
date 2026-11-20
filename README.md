@@ -8,7 +8,7 @@
 
 ## 安装
 
-需要 Tern、OMP 和 `python3`。在本目录执行：
+需要 Tern、OMP 和 Python。插件调用 `python` 运行索引脚本；Windows 上通常是 `python`，macOS/Linux 上若只有 `python3`，可在 `window.luau` 的 `refresh()` 中把命令改回 `python3`。在本目录执行：
 
 ```sh
 tern plugin link .
@@ -29,5 +29,5 @@ Tern 的 `tiles` 布局在一个标签已有多个面板时可能将新侧栏放
 运行侧边栏关闭回归测试（会打开使用独立配置的 Tern 窗口）：
 
 ```sh
-OMP_HISTORY_UI_TEST=1 python3 -m unittest -v test_sidebar
+OMP_HISTORY_UI_TEST=1 python -m unittest -v test_sidebar   # Windows 用 python；macOS/Linux 可用 python3
 ```

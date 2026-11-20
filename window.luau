@@ -34,7 +34,9 @@ local function filter_rows()
 	filtered = {}
 	local needle = string.lower(query)
 	for _, row in rows do
-		local haystack = string.lower(row.title .. " " .. row.cwd .. " " .. row.id)
+		-- 只剥控制字符；Nerd 图标是多字节 UTF-8，字节级 gsub 无法安全剥离，保留即可。
+		local clean_title = string.gsub(row.title or "", "[%c]+", " ")
+		local haystack = string.lower(clean_title .. " " .. (row.cwd or "") .. " " .. (row.id or "") .. " " .. (row.path or ""))
 		if needle == "" or string.find(haystack, needle, 1, true) then
 			table.insert(filtered, row)
 		end
@@ -160,7 +162,7 @@ local function update_sizes(cx)
 				for _, block in tab.blocks or {} do
 					if owned[block.id] and type(block.rows) == "number" and block.rows > 0 then
 						local state = pane_state(block.id)
-						local size = math.max(1, math.min(300, math.floor((block.rows - 4) / 3)))
+						local size = math.max(1, math.min(300, math.floor((block.rows - 5) / 3.4)))
 						if size ~= state.size then
 							local first = (state.page - 1) * state.size
 							state.page = math.floor(first / size) + 1
@@ -376,57 +378,15 @@ tern.command({
 })
 tern.bind("cmd+alt+shift+h", "plugin.omp-history.toggle")
 
--- 诊断命令：把当前所有 pane/tab 信息写进 Tern 日志，用于识别 widget 详情 tab。
-tern.command({
-	id = "diag",
-	title = "OMP History: dump panes (debug)",
-	run = function(cx)
-		tern.log.warn("=== omp-history pane dump ===")
-		for _, pane in ipairs(cx.session:panes()) do
-			tern.log.warn(string.format("pane id=%s kind=%s program=%s tab=%s focused=%s title=%s",
-				tostring(pane.pane), tostring(pane.kind), tostring(pane.program), tostring(pane.tab),
-				tostring(pane.focused), tostring(pane.title)))
-		end
-		for _, tab in ipairs(cx.session:tabs()) do
-			tern.log.warn(string.format("tab id=%s pos=%s title=%s panes=%s",
-				tostring(tab.id), tostring(tab.position), tostring(tab.title), tostring(tab.panes)))
-		end
-		cx:toast("info", "已输出 pane 列表到 Tern 日志", "Open logs and app state")
-	end,
-})
-
--- Widget 点击：Tern 会额外开一个详情 tab，这里关掉它，只保留侧栏。
+-- Widget 点击直接走正常 toggle；同 tab 去重由 tick 保证。
 local function toggle_from_widget(cx)
-	local before = {}
-	for _, pane in ipairs(cx.session:panes()) do before[pane.pane] = true end
-	-- 正常的侧栏切换照常执行
-	local was_visible = tern.kv.get("visible") == true
-	if was_visible then
-		hide_sidebars(cx)
-	else
+	if tern.kv.get("visible") ~= true then
 		tern.kv.set("visible", true)
 		ensure_sidebar(cx)
 		refresh(cx)
+	else
+		hide_sidebars(cx)
 	end
-	-- Tern 的 widget 详情 tab 在点击后异步出现，稍后关掉新增且非侧栏的 pane
-	tern.timer(200, function(later_cx)
-		if not later_cx then return end
-		for _, pane in ipairs(later_cx.session:panes()) do
-			if not before[pane.pane] and not sidebar_tabs[pane.pane] then
-				local ok, tab = pcall(function() return later_cx.session:tab_of(pane.pane) end)
-				if ok and tab then
-					local title = ""
-					for _, t in ipairs(later_cx.session:tabs()) do
-						if t.id == tab then title = t.title or "" break end
-					end
-					-- 只关 Tern 为 widget 新开的详情 tab，避免误伤用户新开内容
-					if title == "OMP History" or title == "显示/隐藏 OMP 会话历史" or title == "" then
-						later_cx.layout:close(pane.pane)
-					end
-				end
-			end
-		end
-	end)
 end
 
 tern.command({

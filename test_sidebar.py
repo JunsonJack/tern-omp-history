@@ -25,7 +25,7 @@ class SidebarCloseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """启动使用独立配置和守护进程的 Tern 窗口。"""
-        cls.temp = tempfile.TemporaryDirectory(prefix="omp-history-test-", dir="/tmp")
+        cls.temp = tempfile.TemporaryDirectory(prefix="omp-history-test-", dir=tempfile.gettempdir(), ignore_cleanup_errors=True)
         root = Path(cls.temp.name)
         config = root / "config"
         workspace = root / "workspace"

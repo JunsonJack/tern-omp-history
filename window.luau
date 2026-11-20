@@ -138,17 +138,31 @@ local function view(pane)
 end
 
 -- 将当前列表同步到插件拥有的所有侧边栏。
+-- 签名必须能吃出“可见内容”的变化：标题被 /rename 或索引刷新改写时，
+-- id 集合往往不变，只有 title/path/updated 变了，否则刷新按钮会静默失效。
+local function content_sig(state)
+	local parts = {
+		tostring(#filtered), query, tostring(error_text), tostring(loading),
+		tostring(state.page), tostring(state.size),
+	}
+	local first = (state.page - 1) * state.size + 1
+	local last = math.min(state.page * state.size, #filtered)
+	for i = first, last do
+		local row = filtered[i]
+		parts[#parts + 1] = row.id
+		parts[#parts + 1] = row.title
+		parts[#parts + 1] = row.cwd
+		parts[#parts + 1] = tostring(row.updated)
+	end
+	return table.concat(parts, "\1")
+end
+
 local function redraw(cx)
-	local base = #filtered
-		.. "|" .. query
-		.. "|" .. tostring(error_text)
-		.. "|" .. tostring(loading)
-		.. "|" .. tostring(rows[1] and rows[1].id)
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
 			sidebar_tabs[canvas.pane] = cx.session:tab_of(canvas.pane)
 			local state = pane_state(canvas.pane)
-			local sig = base .. "|" .. state.page .. "|" .. state.size
+			local sig = content_sig(state)
 			if last_sig[canvas.pane] ~= sig then
 				last_sig[canvas.pane] = sig
 				local main, dock = view(canvas.pane)

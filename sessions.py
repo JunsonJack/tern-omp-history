@@ -7,6 +7,34 @@ from pathlib import Path
 import sys
 
 
+def last_appended_title(path, current):
+    """回读文件尾部，取最后一条 title 记录（omp 改名会追加带 previousTitle 的行）。"""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            window = min(size, 64 * 1024)
+            stream.seek(size - window)
+            chunk = stream.read(window)
+    except OSError:
+        return current
+    lines = chunk.split(b"\n")
+    # 窗口不是从文件头开始时，第一段必然是被截断的行，丢掉。
+    if window < size:
+        lines = lines[1:]
+    found = current
+    for raw in lines:
+        if b'"title"' not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if entry.get("type") == "title":
+            found = entry.get("title") or found
+    return found
+
+
 def main():
     """扫描会话文件并输出标题、工作目录和最后修改时间。"""
     try:
@@ -25,23 +53,28 @@ def main():
             cwd = ""
             session_id = ""
             with path.open("rb") as stream:
-                # 新版 OMP 的标题和 session 头位于文件开头；限制行长避免读取正文。
-                for _ in range(4):
+                # title 通常在第 1 行，但 omp 改名时也可能追加一条带
+                # previousTitle 的记录。这里扫到 session 头为止，取最后一条 title。
+                for _ in range(12):
                     line = stream.readline(1024 * 1024)
                     if not line or not line.endswith(b"\n"):
                         break
                     entry = json.loads(line)
-                    if entry.get("type") == "title":
+                    kind = entry.get("type")
+                    if kind == "title":
                         title = entry.get("title") or title
-                    elif entry.get("type") == "session":
+                    elif kind == "session":
                         cwd = entry.get("cwd") or ""
                         session_id = entry.get("id") or ""
                         break
+                # 首行不是 title 且追加记录在文件尾时，回读最后 64KB 找最新 title。
+                if session_id:
+                    title = last_appended_title(path, title)
             if not session_id:
                 continue
             rows.append({"id": session_id, "title": title or "未命名会话", "cwd": cwd,
                          "path": str(path), "updated": path.stat().st_mtime})
-        except (OSError, ValueError, TypeError, AttributeError):
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
             continue
     rows.sort(key=lambda row: row["updated"], reverse=True)
     json.dump(rows, sys.stdout, ensure_ascii=True)

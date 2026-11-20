@@ -57,9 +57,23 @@ def main():
                 # previousTitle 的记录。这里扫到 session 头为止，取最后一条 title。
                 for _ in range(12):
                     line = stream.readline(1024 * 1024)
-                    if not line or not line.endswith(b"\n"):
+                    if not line:
                         break
-                    entry = json.loads(line)
+                    if not line.endswith(b"\n"):
+                        if len(line) >= 1024 * 1024:
+                            # 这一行超过 1MB，位置停在行中间。先把它剩余部分读完
+                            # （跳过不解析），再继续找 session 头；
+                            # 否则整个会话会因为一个读不全的行而消失。
+                            while True:
+                                rest = stream.readline(1024 * 1024)
+                                if not rest or rest.endswith(b"\n"):
+                                    break
+                            continue
+                        break
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
                     kind = entry.get("type")
                     if kind == "title":
                         title = entry.get("title") or title

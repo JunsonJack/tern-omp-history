@@ -24,8 +24,33 @@ local last_sig = {}
 local chat_panes = {}
 
 -- 转义传给终端 shell 的单个参数。
+-- POSIX 用 '\'' 折行单引号；Windows 的 PowerShell 不认这个序列，
+-- 单引号里两个连续单引号才是转义，所以按平台分别处理。
 local function shell_quote(value)
+	if tern.runtime.os == "windows" then
+		return "'" .. string.gsub(value, "'", "''") .. "'"
+	end
 	return "'" .. string.gsub(value, "'", "'\\''") .. "'"
+end
+
+-- 活着的 timer 句柄：递归 timer 每次触发都会产生新句柄，
+-- 所以登记表按名字覆盖，unload 时统一取消，避免重载后旧 VM 的定时器变成孤儿。
+local timer_slots = {}
+local unloading = false
+
+local function every(name, ms, fn)
+	local slot = { ms = ms, fn = fn }
+	timer_slots[name] = slot
+	local function arm()
+		slot.handle = tern.timer(ms, function(cx)
+			if unloading or timer_slots[name] ~= slot then return end
+			-- 先重新挂载再执行，fn 抛错也不会让定时器就此停摆。
+			arm()
+			fn(cx)
+		end)
+	end
+	arm()
+	return slot
 end
 
 -- 为每个侧边栏保留独立的页码与可见行数。
@@ -65,7 +90,13 @@ local function view(pane)
 	local ui = tern.ui
 	local state = pane_state(pane)
 	local pages = math.max(1, math.ceil(#filtered / state.size))
-	state.page = math.max(1, math.min(state.page, pages))
+	local clamped = math.max(1, math.min(state.page, pages))
+	-- pane 为 nil 时 pane_state 返回临时表，clamp 结果不该只写在那张临时表上；
+	-- 有真实 pane 时同步回去，避免页码与渲染不一致导致多画一次。
+	if clamped ~= state.page then
+		state.page = clamped
+		if pane and panes[pane] then panes[pane].page = clamped end
+	end
 	local cards = {}
 	if error_text then
 		table.insert(cards, ui.card("读取失败", {
@@ -89,21 +120,32 @@ local function view(pane)
 	local first = (state.page - 1) * state.size + 1
 	local last = math.min(state.page * state.size, #filtered)
 	local now = os.time()
+	-- 按日历日往前推一天：原来用 now - (小时+12)*3600 在凌晨会把前天算成昨天。
+	local today_t = os.date("*t", now)
+	local yesterday_ts = os.time({
+		year = today_t.year, month = today_t.month, day = today_t.day - 1,
+		hour = 12, min = 0, sec = 0,
+	})
 	local today = os.date("%Y-%m-%d", now)
-	local yesterday = os.date("%Y-%m-%d", now - (tonumber(os.date("%H", now)) + 12) * 3600)
+	local yesterday = os.date("%Y-%m-%d", yesterday_ts)
 	for i = first, last do
 		local row = filtered[i]
-		local title = string.gsub(row.title, "[%c]+", " ")
-		local cwd = if row.cwd ~= "" then (string.match(row.cwd, "([^/]+)$") or string.match(row.cwd, "([^\\]+)$") or row.cwd) else "未知目录"
-		local day = os.date("%Y-%m-%d", row.updated)
-		local short_id = string.sub(row.id, 1, 8)
-		local rel = relative_time(row.updated)
-		local day_label = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%m-%d", row.updated)
+		-- 索引来自外部脚本，字段可能缺失；逐个兜底，避免一行坏数据让整块侧栏崩掉。
+		local raw_title = tostring(row.title or "未命名会话")
+		local title = string.gsub(raw_title, "[%c]+", " ")
+		local raw_cwd = tostring(row.cwd or "")
+		local cwd = if raw_cwd ~= "" then (string.match(raw_cwd, "([^/]+)$") or string.match(raw_cwd, "([^\\]+)$") or raw_cwd) else "未知目录"
+		local updated = tonumber(row.updated) or 0
+		local row_id = tostring(row.id or "")
+		local day = os.date("%Y-%m-%d", updated)
+		local short_id = string.sub(row_id, 1, 8)
+		local rel = relative_time(updated)
+		local day_label = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%m-%d", updated)
 		table.insert(cards, ui.el("button", {
-			key = "chat_" .. row.id,
+			key = "chat_" .. row_id,
 			class = "omp-history-card",
-			title = title .. "\n" .. row.cwd .. "\n" .. row.id,
-			actions = { click = "chat:" .. row.id },
+			title = title .. "\n" .. raw_cwd .. "\n" .. row_id,
+			actions = { click = "chat:" .. row_id },
 		}, {
 			ui.el("div", { class = "omp-history-title", text = title }),
 			ui.node("row", { gap = "xs", class = "omp-history-meta" }, {
@@ -164,10 +206,11 @@ local function redraw(cx)
 			local state = pane_state(canvas.pane)
 			local sig = content_sig(state)
 			if last_sig[canvas.pane] ~= sig then
-				last_sig[canvas.pane] = sig
 				local main, dock = view(canvas.pane)
-				-- 超节点上限时 canvas:set 会抛错，别让一次失败打断整轮重绘。
-				pcall(cx.canvas.set, cx.canvas, canvas.pane, { view = main, dock = dock })
+				-- 超节点上限时 canvas:set 会抛错；只在成功后才记账，
+				-- 否则一次失败会让签名永久停留在“已发送”，后续内容变化不再重绘。
+				local ok = pcall(cx.canvas.set, cx.canvas, canvas.pane, { view = main, dock = dock })
+				if ok then last_sig[canvas.pane] = sig end
 			end
 		end
 	end
@@ -304,12 +347,19 @@ end
 
 -- 保留现有组件设置，添加供窗口右上角显示的历史入口。
 local function ensure_toolbar_widget(cx)
+	-- widgets 是一个整体数组，每次 window_start / 重载都读改写会和其他插件
+	-- 或用户的并发修改抢写。写成功一次后就用 kv 记住，不再重复触碰。
+	if tern.kv.get("widget_added") == true then return end
 	local widgets = cx.settings:get("widgets") or {}
 	for _, widget in widgets do
-		if widget.id == "omp-history/toggle" then return end
+		if widget.id == "omp-history/toggle" then
+			tern.kv.set("widget_added", true)
+			return
+		end
 	end
 	table.insert(widgets, { id = "omp-history/toggle" })
-	cx.settings:set("widgets", widgets)
+	local ok = pcall(cx.settings.set, cx.settings, "widgets", widgets)
+	if ok then tern.kv.set("widget_added", true) end
 end
 
 -- 找到当前标签最右侧的实际内容窗格，避免把侧边栏再次拆开。
@@ -449,13 +499,17 @@ tern.chrome.widget("toggle", {
 
 -- 定期在新标签上挂载面板，并清理只剩侧边栏的标签。
 local function tick(cx)
-	tern.timer(1000, tick)
 	if not cx then return end
 	-- 去重：同一 tab 只允许一个 OMP History canvas，多余的关掉。
+	-- 一次扫 pane 得到 tab 与每 tab 的 pane 计数，避免在 canvas 循环里再扫一遍。
 	local seen_tab = {}
 	local pane_tab = {}
+	local tab_count = {}
 	local closed_any = false
-	for _, info in ipairs(cx.session:panes()) do pane_tab[info.pane] = info.tab end
+	for _, info in ipairs(cx.session:panes()) do
+		pane_tab[info.pane] = info.tab
+		if info.tab then tab_count[info.tab] = (tab_count[info.tab] or 0) + 1 end
+	end
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
 			local tab = pane_tab[canvas.pane] or cx.session:tab_of(canvas.pane)
@@ -471,11 +525,7 @@ local function tick(cx)
 					seen_tab[tab] = canvas.pane
 				end
 			end
-			local count = 0
-			for _, pane in ipairs(cx.session:panes()) do
-				if pane.tab == tab then count += 1 end
-			end
-			if tab and count == 1 then
+			if tab and tab_count[tab] == 1 then
 				sidebar_tabs[canvas.pane] = nil
 				last_sig[canvas.pane] = nil
 				cx.layout:close(canvas.pane)
@@ -520,9 +570,18 @@ tern.on("pane_closed", function(ev, cx)
 end)
 
 -- 定期刷新历史，手动刷新和搜索不必等待定时器。
+-- 用户正在搜索或已翻到后面的页时跳过：列表按 mtime 排序，后台写入会让
+-- 卡片跳到前面，翻页时被打断更烦。
+local function view_is_stable()
+	if query ~= "" then return false end
+	for _, state in panes do
+		if state.page > 1 then return false end
+	end
+	return true
+end
+
 local function refresh_tick(cx)
-	tern.timer(30000, refresh_tick)
-	if cx then refresh(cx) end
+	if cx and view_is_stable() then refresh(cx) end
 end
 
 tern.on("window_start", function(cx)
@@ -532,12 +591,23 @@ tern.on("window_start", function(cx)
 	refresh(cx)
 end)
 -- 插件重载不会重新触发 window_start，需要主动恢复索引。
-tern.timer(100, function(cx)
+every("boot", 100, function(cx)
 	if cx then
 		initialize_visibility(cx)
 		ensure_toolbar_widget(cx)
 		refresh(cx)
 	end
 end)
-tern.timer(1000, tick)
-tern.timer(30000, refresh_tick)
+every("tick", 1000, tick)
+every("refresh", 30000, refresh_tick)
+
+-- 重载或关闭插件时取消所有 timer，并释放可能仍在跑的子进程。
+tern.on("unload", function()
+	unloading = true
+	for _, slot in timer_slots do
+		if slot.handle then pcall(slot.handle.cancel, slot.handle) end
+	end
+	timer_slots = {}
+	loading = false
+	sizing = false
+end)

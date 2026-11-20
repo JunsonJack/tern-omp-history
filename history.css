@@ -5,7 +5,7 @@
 .omp-history-card {
   display: block;
   width: 100%;
-  height: calc(3 * var(--sf-lh));
+  height: calc(3.4 * var(--sf-lh));
   padding: calc(0.5 * var(--sf-lh)) 8px;
   overflow: hidden;
   border: 0;
@@ -57,6 +57,19 @@
   text-align: right;
 }
 
+/* 会话卡片元信息行：徽标 + 日期 + 目录 + 短 ID。 */
+.omp-history-meta {
+  display: flex !important;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.omp-history-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* 小组件作为窗口工具栏入口，与原有按钮保持间距。 */
 html.tn-widgets #widgetbar {
   position: absolute !important;
@@ -80,13 +93,13 @@ html.tn-widgets #widgetbar .wg-row {
 }
 
 html.tn-widgets #tabbar .tb-in {
-  padding-right: 30px;
+  padding-right: 56px;
 }
 
 #widgetbar .wg[title="显示/隐藏 OMP 会话历史"] {
   position: fixed;
   top: 6px;
-  right: 12px;
+  right: 90px;
   z-index: 9999;
   display: flex;
   align-items: center;

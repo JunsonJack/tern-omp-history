@@ -41,6 +41,17 @@ local function filter_rows()
 	end
 end
 
+-- 人类友好的相对时间：几分钟前/几小时前/几天前，超过一周用日期。
+local function relative_time(ts)
+	local diff = os.time() - ts
+	if diff < 0 then diff = 0 end
+	if diff < 60 then return "刚刚" end
+	if diff < 3600 then return math.floor(diff / 60) .. " 分钟前" end
+	if diff < 86400 then return math.floor(diff / 3600) .. " 小时前" end
+	if diff < 604800 then return math.floor(diff / 86400) .. " 天前" end
+	return os.date("%m-%d", ts)
+end
+
 -- 构建当前窗格的会话卡片和固定在底部的分页栏。
 local function view(pane)
 	local ui = tern.ui
@@ -49,38 +60,59 @@ local function view(pane)
 	state.page = math.max(1, math.min(state.page, pages))
 	local cards = {}
 	if error_text then
-		table.insert(cards, ui.text("读取失败：" .. error_text))
+		table.insert(cards, ui.card("读取失败", {
+			ui.text(error_text),
+			ui.text("检查会话目录：$PI_CODING_AGENT_DIR/sessions 或 ~/.omp/agent/sessions"),
+		}, { tone = "error", icon = "warning" }))
 	elseif loading and #rows == 0 then
 		table.insert(cards, ui.text("正在读取会话…"))
 	elseif #filtered == 0 then
-		table.insert(cards, ui.text(if query == "" then "没有保存的会话" else "没有匹配的会话"))
+		if query == "" then
+			table.insert(cards, ui.card("没有保存的会话", {
+				ui.text("运行一次 omp 后会自动出现在这里"),
+			}, { tone = "muted", icon = "history" }))
+		else
+			table.insert(cards, ui.card("没有匹配的会话", {
+				ui.text("搜索词：" .. query),
+				ui.text("可搜索标题、目录或会话 ID"),
+			}, { tone = "muted", icon = "search" }))
+		end
 	end
 	local first = (state.page - 1) * state.size + 1
 	local last = math.min(state.page * state.size, #filtered)
 	local now = os.time()
 	local today = os.date("%Y-%m-%d", now)
-	-- 取昨天中午，避免夏令时切换导致跨日判断偏差。
 	local yesterday = os.date("%Y-%m-%d", now - (tonumber(os.date("%H", now)) + 12) * 3600)
 	for i = first, last do
 		local row = filtered[i]
 		local title = string.gsub(row.title, "[%c]+", " ")
-		local cwd = if row.cwd ~= "" then (string.match(row.cwd, "([^/]+)/*$") or row.cwd) else "未知目录"
+		local cwd = if row.cwd ~= "" then (string.match(row.cwd, "([^/]+)$") or string.match(row.cwd, "([^\\]+)$") or row.cwd) else "未知目录"
 		local day = os.date("%Y-%m-%d", row.updated)
-		local date = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%Y-%m-%d %H:%M", row.updated)
+		local short_id = string.sub(row.id, 1, 8)
+		local rel = relative_time(row.updated)
+		local day_label = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%m-%d", row.updated)
 		table.insert(cards, ui.el("button", {
 			key = "chat_" .. row.id,
 			class = "omp-history-card",
-			title = title,
+			title = title .. "\n" .. row.cwd .. "\n" .. row.id,
 			actions = { click = "chat:" .. row.id },
 		}, {
 			ui.el("div", { class = "omp-history-title", text = title }),
-			ui.el("div", { class = "omp-history-meta", text = date .. " · " .. cwd }),
+			ui.node("row", { gap = "xs", class = "omp-history-meta" }, {
+				ui.badge(rel, if day == today then "accent" else "muted"),
+				ui.el("span", { text = day_label }),
+				ui.el("span", { text = "·" }),
+				ui.el("span", { text = cwd }),
+				ui.el("span", { text = "·" }),
+				ui.el("span", { text = short_id }),
+			}),
 		}))
 	end
+	local search_label = if query == "" then "搜索" else "搜索: " .. query
 	local main = ui.node("col", { gap = "none" }, {
 		ui.node("row", { gap = "sm", justify = "end" }, {
-			ui.button("", { icon = "search", title = "搜索", size = "sm", actions = { click = "search" } }),
-			ui.button("", { icon = "repeat", title = "刷新", size = "sm", actions = { click = "refresh" } }),
+			ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
+			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }),
 		}),
 		ui.el("div", { class = "omp-history-list" }, cards),
 	})
@@ -91,7 +123,7 @@ local function view(pane)
 				ui.text(state.page .. " / " .. pages),
 				ui.button("", { icon = "arrow-right", title = "下一页", size = "sm", disabled = state.page == pages, actions = { click = "next" } }),
 			}),
-			ui.el("div", { class = "omp-history-count", text = tostring(#filtered) .. " 个会话" }),
+			ui.el("div", { class = "omp-history-count", text = if #filtered == 0 then "0 个会话" else ("第 " .. first .. "–" .. last .. " / 共 " .. #filtered .. " 个") }),
 		}),
 	})
 	return main, dock
@@ -147,7 +179,7 @@ end
 local function refresh(cx)
 	if loading then return end
 	loading = true
-	tern.process.run({ "python3", tern.plugin.dir .. "/sessions.py" }, { timeout_ms = 30000 }, function(result, next_cx)
+	tern.process.run({ "python", tern.plugin.dir .. "/sessions.py" }, { timeout_ms = 30000 }, function(result, next_cx)
 		loading = false
 		if not next_cx then return end
 		if result.status ~= 0 then
@@ -173,11 +205,25 @@ local function ensure_sidebar(cx)
 	local focused = cx.session:focused()
 	local tab = if focused then cx.session:tab_of(focused) else nil
 	if not tab then return end
+	-- 先收集当前 tab 下的所有 pane；用 PaneInfo.tab 判断，避免 tab_of 在 canvas 刚
+	-- 创建、尚未注册到 session 树时返回 nil 而重复开窗。
+	local panes_in_tab = {}
+	for _, info in ipairs(cx.session:panes()) do
+		if info.tab == tab then
+			panes_in_tab[info.pane] = true
+			if info.program == "tern.canvas" and info.title == TITLE then
+				sidebar_tabs[info.pane] = tab
+				return
+			end
+		end
+	end
+	-- 再同步一遍 canvas owner 记录（tab_of 此时通常已可用）。
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
-			local canvas_tab = cx.session:tab_of(canvas.pane)
-			sidebar_tabs[canvas.pane] = canvas_tab
-			if canvas_tab == tab then return end
+			if panes_in_tab[canvas.pane] or cx.session:tab_of(canvas.pane) == tab then
+				sidebar_tabs[canvas.pane] = tab
+				return
+			end
 		end
 	end
 	opening = true
@@ -330,12 +376,71 @@ tern.command({
 })
 tern.bind("cmd+alt+shift+h", "plugin.omp-history.toggle")
 
+-- 诊断命令：把当前所有 pane/tab 信息写进 Tern 日志，用于识别 widget 详情 tab。
+tern.command({
+	id = "diag",
+	title = "OMP History: dump panes (debug)",
+	run = function(cx)
+		tern.log.warn("=== omp-history pane dump ===")
+		for _, pane in ipairs(cx.session:panes()) do
+			tern.log.warn(string.format("pane id=%s kind=%s program=%s tab=%s focused=%s title=%s",
+				tostring(pane.pane), tostring(pane.kind), tostring(pane.program), tostring(pane.tab),
+				tostring(pane.focused), tostring(pane.title)))
+		end
+		for _, tab in ipairs(cx.session:tabs()) do
+			tern.log.warn(string.format("tab id=%s pos=%s title=%s panes=%s",
+				tostring(tab.id), tostring(tab.position), tostring(tab.title), tostring(tab.panes)))
+		end
+		cx:toast("info", "已输出 pane 列表到 Tern 日志", "Open logs and app state")
+	end,
+})
+
+-- Widget 点击：Tern 会额外开一个详情 tab，这里关掉它，只保留侧栏。
+local function toggle_from_widget(cx)
+	local before = {}
+	for _, pane in ipairs(cx.session:panes()) do before[pane.pane] = true end
+	-- 正常的侧栏切换照常执行
+	local was_visible = tern.kv.get("visible") == true
+	if was_visible then
+		hide_sidebars(cx)
+	else
+		tern.kv.set("visible", true)
+		ensure_sidebar(cx)
+		refresh(cx)
+	end
+	-- Tern 的 widget 详情 tab 在点击后异步出现，稍后关掉新增且非侧栏的 pane
+	tern.timer(200, function(later_cx)
+		if not later_cx then return end
+		for _, pane in ipairs(later_cx.session:panes()) do
+			if not before[pane.pane] and not sidebar_tabs[pane.pane] then
+				local ok, tab = pcall(function() return later_cx.session:tab_of(pane.pane) end)
+				if ok and tab then
+					local title = ""
+					for _, t in ipairs(later_cx.session:tabs()) do
+						if t.id == tab then title = t.title or "" break end
+					end
+					-- 只关 Tern 为 widget 新开的详情 tab，避免误伤用户新开内容
+					if title == "OMP History" or title == "显示/隐藏 OMP 会话历史" or title == "" then
+						later_cx.layout:close(pane.pane)
+					end
+				end
+			end
+		end
+	end)
+end
+
+tern.command({
+	id = "toggle_widget",
+	title = "OMP History: toggle (widget)",
+	run = function(cx) toggle_from_widget(cx) end,
+})
+
 tern.chrome.widget("toggle", {
 	name = "OMP History",
 	description = "显示或隐藏 OMP 会话历史",
 	icon = "history",
 	render = function(_pane)
-		return { text = "", title = "显示/隐藏 OMP 会话历史", command = "plugin.omp-history.toggle" }
+		return { text = "", title = "显示/隐藏 OMP 会话历史", command = "plugin.omp-history.toggle_widget" }
 	end,
 })
 
@@ -343,12 +448,25 @@ tern.chrome.widget("toggle", {
 local function tick(cx)
 	tern.timer(1000, tick)
 	if not cx then return end
+	-- 去重：同一 tab 只允许一个 OMP History canvas，多余的关掉。
+	local seen_tab = {}
+	local pane_tab = {}
+	for _, info in ipairs(cx.session:panes()) do pane_tab[info.pane] = info.tab end
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
-			local tab = cx.session:tab_of(canvas.pane)
+			local tab = pane_tab[canvas.pane] or cx.session:tab_of(canvas.pane)
 			sidebar_tabs[canvas.pane] = tab
+			if tab then
+				if seen_tab[tab] then
+					sidebar_tabs[canvas.pane] = nil
+					panes[canvas.pane] = nil
+					cx.layout:close(canvas.pane)
+				else
+					seen_tab[tab] = canvas.pane
+				end
+			end
 			local count = 0
-			for _, pane in cx.session:panes() do
+			for _, pane in ipairs(cx.session:panes()) do
 				if pane.tab == tab then count += 1 end
 			end
 			if tab and count == 1 then

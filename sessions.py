@@ -9,6 +9,10 @@ import sys
 
 def main():
     """扫描会话文件并输出标题、工作目录和最后修改时间。"""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
     agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".omp" / "agent"))
     sessions_dir = agent_dir / "sessions"
     if not sessions_dir.is_dir():
@@ -40,7 +44,7 @@ def main():
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     rows.sort(key=lambda row: row["updated"], reverse=True)
-    json.dump(rows, sys.stdout, ensure_ascii=False)
+    json.dump(rows, sys.stdout, ensure_ascii=True)
 
 
 if __name__ == "__main__":

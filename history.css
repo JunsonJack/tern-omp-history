@@ -110,6 +110,11 @@
   text-align: right;
 }
 
+/* 工具栏与下方列表的间距；按钮行靠右。 */
+.omp-history-toolbar {
+  padding-bottom: 2px;
+}
+
 /* 会话卡片元信息行：徽标 + 日期 + 目录 + 短 ID。
    ui.el div 是 flex 容器；内部 ui.node row 负责原生排布，被压缩时整行溢出隐藏。 */
 .omp-history-meta {

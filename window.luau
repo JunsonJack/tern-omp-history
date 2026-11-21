@@ -264,10 +264,18 @@ local function view(pane)
 		end
 	end
 	local search_label = if query == "" then "搜索" else "搜索: " .. query
-	local main = ui.node("col", { gap = "none" }, {
-		ui.node("row", { gap = "sm", justify = "end" }, {
-			ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
-			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }),
+	local toolbar
+	if query == "" then
+		toolbar = { ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
+			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }) }
+	else
+		toolbar = { ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
+			ui.button("重置", { icon = "x", title = "清除搜索词并显示全部会话", size = "sm", actions = { click = "search_reset" } }),
+			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }) }
+	end
+	local main = ui.node("col", { gap = "sm" }, {
+		ui.el("div", { class = "omp-history-toolbar" }, {
+			ui.node("row", { gap = "sm", justify = "end" }, toolbar),
 		}),
 		ui.el("div", { class = "omp-history-list" }, cards),
 	})
@@ -547,6 +555,11 @@ tern.on("canvas_action", function(ev, cx)
 				redraw(next_cx)
 			end
 		end)
+	elseif ev.act == "search_reset" then
+		query = ""
+		for _, state in panes do state.page = 1 end
+		filter_rows()
+		redraw(cx)
 	elseif ev.act == "refresh" then
 		refresh(cx)
 	elseif ev.act == "prev" then

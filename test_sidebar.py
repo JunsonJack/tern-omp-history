@@ -131,5 +131,71 @@ class SidebarCloseTest(unittest.TestCase):
         self.assertEqual(self.sidebar_count(), 1)
 
 
+@unittest.skipUnless(
+    TERN and os.environ.get("OMP_HISTORY_UI_TEST") == "1",
+    "需要 Tern 和 OMP_HISTORY_UI_TEST=1；测试会打开隔离窗口",
+)
+class GroupCollapseTest(unittest.TestCase):
+    """验证按项目分组的折叠行为。复用 SidebarCloseTest 的隔离窗口引导。
+
+    不继承 SidebarCloseTest：它自带的 test_close_* 在本机环境因
+    `tern ls --json` 缺 daemon.sock 必然报错，还会把侧边栏留在关闭态。"""
+
+    ctl = SidebarCloseTest.__dict__["ctl"]
+    cleanup_window = SidebarCloseTest.__dict__["cleanup_window"]
+
+    @classmethod
+    def setUpClass(cls):
+        # 复用 SidebarCloseTest 的隔离窗口引导：取出底层函数以 cls=本类调用。
+        SidebarCloseTest.__dict__["setUpClass"].__func__(cls)
+        sessions_dir = Path(cls.temp.name) / "agent" / "sessions"
+        for index, project in enumerate(("proj-alpha", "proj-beta")):
+            project_dir = Path(cls.temp.name) / "workspace" / project
+            project_dir.mkdir(exist_ok=True)
+            session_dir = sessions_dir / f"sess-{index:02d}"
+            session_dir.mkdir(exist_ok=True)
+            (session_dir / "conv.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"type": "title", "title": f"{project} 会话"}),
+                    json.dumps({"type": "session", "id": f"id-{index:02d}" * 4, "cwd": str(project_dir)}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+        # 索引冷启动要拉起 python 子进程，首次渲染可能十几秒；轮询等组头出现。
+        cls.ctl("plugins", "run", "plugin.omp-history.toggle")
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if cls.ctl("tree", ".omp-history-group").get("count", 0) >= 2:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("分组头未在 40s 内渲染")
+
+    def group_count(self):
+        return self.ctl("tree", ".omp-history-group").get("count", 0)
+
+    def card_count(self):
+        return self.ctl("tree", ".omp-history-card").get("count", 0)
+
+    def test_group_headers_render_and_collapse(self):
+        """分组模式下出现组头；点击组头折叠后卡片数减少，再点恢复。"""
+        self.assertGreaterEqual(self.group_count(), 2, "应渲染出至少两个项目组头")
+        before = self.card_count()
+        self.assertGreaterEqual(before, 2, "折叠前应有两个会话卡")
+
+        self.ctl("click", '.omp-history-group[title*="proj-alpha"]')
+        self.ctl("wait", "1000")
+        self.assertEqual(self.group_count(), 2, "折叠后组头仍应保留（重新展开入口）")
+        after = self.card_count()
+        self.assertLess(after, before, "折叠后可见会话卡应减少")
+        kv = (Path(self.temp.name) / "config" / "plugin-data" / "omp-history" / "kv.json")
+        if kv.exists():
+            self.assertIn("proj-alpha", kv.read_text(encoding="utf-8"))
+
+        self.ctl("click", '.omp-history-group[title*="proj-alpha"]')
+        self.ctl("wait", "1000")
+        self.assertEqual(self.card_count(), before, "再次点击组头应重新展开")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -78,6 +78,69 @@ local function filter_rows()
 	end
 end
 
+-- 项目分组状态：按 cwd 全路径折叠。kv 持久化，跨插件重载保留。
+local collapsed_projects = {}
+
+local function load_collapsed()
+	collapsed_projects = {}
+	local saved = tern.kv.get("collapsed_projects")
+	if type(saved) ~= "table" then return end
+	for key in saved do collapsed_projects[key] = true end
+end
+
+local function save_collapsed()
+	local saved = {}
+	for key in collapsed_projects do saved[key] = true end
+	tern.kv.set("collapsed_projects", saved)
+end
+
+local function project_name(cwd)
+	if cwd == "" then return "未知目录" end
+	return string.match(cwd, "([^/\\]+)[/\\]?$") or cwd
+end
+
+-- 把 filtered 按 cwd 分组：组内 mtime 降序，组间按组内最新会话降序，
+-- 最近活跃的项目在最上面。空 cwd 归入 "" 组沉底。
+-- rows 本身已按 updated 降序，组内顺序直接沿用；组间用首条（最新）比较。
+local function build_groups()
+	local order = {}
+	local groups = {}
+	for _, row in filtered do
+		local key = tostring(row.cwd or "")
+		local group = groups[key]
+		if not group then
+			group = { key = key, name = project_name(key), rows = {} }
+			groups[key] = group
+			table.insert(order, group)
+		end
+		table.insert(group.rows, row)
+	end
+	table.sort(order, function(a, b)
+		-- 空目录组沉底；其余按组内最新会话时间比较。
+		local a_empty = a.key == ""
+		local b_empty = b.key == ""
+		if a_empty ~= b_empty then return b_empty end
+		return a.rows[1].updated > b.rows[1].updated
+	end)
+	return order
+end
+
+-- 折叠视图下把组展开成“组头 + 会话卡”的渲染序列。返回 seq 中每项
+-- { kind = "group"|"chat", group = group, row = row }，分页只数会话卡。
+-- 折叠组的组头必须保留，否则没有可点击的入口重新展开。
+local function flatten_groups(groups)
+	local seq = {}
+	for _, group in groups do
+		table.insert(seq, { kind = "group", group = group })
+		if not collapsed_projects[group.key] then
+			for _, row in group.rows do
+				table.insert(seq, { kind = "chat", group = group, row = row })
+			end
+		end
+	end
+	return seq
+end
+
 -- 人类友好的相对时间：几分钟前/几小时前/几天前，超过一周用日期。
 local function relative_time(ts)
 	local diff = os.time() - ts
@@ -93,7 +156,10 @@ end
 local function view(pane)
 	local ui = tern.ui
 	local state = pane_state(pane)
-	local pages = math.max(1, math.ceil(#filtered / state.size))
+	local grouped = query == ""
+	-- 分页以“会话卡”为单位；分组模式下走渲染序列，平铺（搜索时）直接用 filtered。
+	local total_cards = #filtered
+	local pages = math.max(1, math.ceil(total_cards / state.size))
 	local clamped = math.max(1, math.min(state.page, pages))
 	-- pane 为 nil 时 pane_state 返回临时表，clamp 结果不该只写在那张临时表上；
 	-- 有真实 pane 时同步回去，避免页码与渲染不一致导致多画一次。
@@ -109,7 +175,7 @@ local function view(pane)
 		}, { tone = "error", icon = "warning" }))
 	elseif loading and #rows == 0 then
 		table.insert(cards, ui.text("正在读取会话…"))
-	elseif #filtered == 0 then
+	elseif total_cards == 0 then
 		if query == "" then
 			table.insert(cards, ui.card("没有保存的会话", {
 				ui.text("运行一次 omp 后会自动出现在这里"),
@@ -122,7 +188,7 @@ local function view(pane)
 		end
 	end
 	local first = (state.page - 1) * state.size + 1
-	local last = math.min(state.page * state.size, #filtered)
+	local last = math.min(state.page * state.size, total_cards)
 	local now = os.time()
 	-- 按日历日往前推一天：原来用 now - (小时+12)*3600 在凌晨会把前天算成昨天。
 	local today_t = os.date("*t", now)
@@ -132,8 +198,8 @@ local function view(pane)
 	})
 	local today = os.date("%Y-%m-%d", now)
 	local yesterday = os.date("%Y-%m-%d", yesterday_ts)
-	for i = first, last do
-		local row = filtered[i]
+	-- 构建会话卡片；day_label 参数避免循环里重复算日历日。
+	local function chat_card(row)
 		-- 索引来自外部脚本，字段可能缺失；逐个兜底，避免一行坏数据让整块侧栏崩掉。
 		local raw_title = tostring(row.title or "未命名会话")
 		local title = string.gsub(raw_title, "[%c]+", " ")
@@ -145,9 +211,9 @@ local function view(pane)
 		local short_id = string.sub(row_id, 1, 8)
 		local rel = relative_time(updated)
 		local day_label = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%m-%d", updated)
-		table.insert(cards, ui.el("button", {
+		return ui.el("button", {
 			key = "chat_" .. row_id,
-			class = "omp-history-card",
+			class = "omp-history-card" .. (if grouped then " omp-history-card-indented" else ""),
 			title = title .. "\n" .. raw_cwd .. "\n" .. row_id,
 			actions = { click = "chat:" .. row_id },
 		}, {
@@ -160,7 +226,39 @@ local function view(pane)
 				ui.el("span", { text = "·" }),
 				ui.el("span", { text = short_id }),
 			}),
-		}))
+		})
+	end
+	if grouped and total_cards > 0 then
+		local seq = flatten_groups(build_groups())
+		-- 卡片序号即分页游标：跳过序号不在 [first, last] 的卡片，组头总是
+		-- 插在它组内首个可见卡片之前，一组跨页时下一页顶部会重复组头。
+		local cursor = 0
+		for _, item in seq do
+			if item.kind == "group" then
+				local group = item.group
+				local collapsed = collapsed_projects[group.key] == true
+				table.insert(cards, ui.el("button", {
+					key = "group_" .. string.gsub(group.key, "[%c]+", "_"),
+					class = "omp-history-group",
+					title = group.key ~= "" and group.key or "工作目录未知",
+					actions = { click = "group:" .. group.key },
+				}, {
+					ui.el("span", { class = "omp-history-chevron" .. (if collapsed then " omp-history-chevron-closed" else ""), text = "▼" }),
+					ui.el("span", { class = "omp-history-group-name", text = group.name }),
+					ui.el("span", { text = "·" }),
+					ui.el("span", { class = "omp-history-group-count", text = tostring(#group.rows) }),
+				}))
+			else
+				cursor = cursor + 1
+				if cursor >= first and cursor <= last then
+					table.insert(cards, chat_card(item.row))
+				end
+			end
+		end
+	else
+		for i = first, last do
+			table.insert(cards, chat_card(filtered[i]))
+		end
 	end
 	local search_label = if query == "" then "搜索" else "搜索: " .. query
 	local main = ui.node("col", { gap = "none" }, {
@@ -199,6 +297,14 @@ local function content_sig(state)
 		parts[#parts + 1] = row.title
 		parts[#parts + 1] = row.cwd
 		parts[#parts + 1] = tostring(row.updated)
+	end
+	-- 分组模式额外吃出组序/组大小/折叠状态的变化，否则折叠点击和
+	-- 索引刷新导致的组序变化不会重绘。
+	if query == "" then
+		for _, group in build_groups() do
+			parts[#parts + 1] = "g:" .. group.key .. ":" .. #group.rows .. ":" .. tostring(group.rows[1].updated)
+			parts[#parts + 1] = if collapsed_projects[group.key] then "c" else "o"
+		end
 	end
 	return table.concat(parts, "\1")
 end
@@ -409,6 +515,7 @@ end
 tern.on("canvas_action", function(ev, cx)
 	if ev.owner ~= tern.plugin.id then return nil end
 	local id = string.match(ev.act, "^chat:(.+)$")
+	local key = if not id then string.match(ev.act, "^group:(.+)$") else nil
 	if id then
 		for _, row in rows do
 			if row.id == id then
@@ -416,6 +523,16 @@ tern.on("canvas_action", function(ev, cx)
 				break
 			end
 		end
+	elseif key then
+		-- 组键是完整 cwd 路径，action 字符串里不会出现换行，直接拼回去安全。
+		if collapsed_projects[key] then
+			collapsed_projects[key] = nil
+		else
+			collapsed_projects[key] = true
+		end
+		save_collapsed()
+		for _, state in panes do state.page = 1 end
+		redraw(cx)
 	elseif ev.act == "search" then
 		cx:prompt({ value = query, placeholder = "搜索标题、目录或会话 ID", action = "search" }):next(function(value, err, next_cx)
 			if not next_cx then return end
@@ -619,6 +736,7 @@ end
 tern.on("window_start", function(cx)
 	initialize_visibility(cx)
 	ensure_toolbar_widget(cx)
+	load_collapsed()
 	ensure_sidebar(cx)
 	refresh(cx)
 end)
@@ -627,6 +745,7 @@ every("boot", 100, function(cx)
 	if cx then
 		initialize_visibility(cx)
 		ensure_toolbar_widget(cx)
+		load_collapsed()
 		refresh(cx)
 		-- 初始化完成即停：这里只是补跑 reload 后缺失的 window_start，
 		-- 不是轮询；继续挂着会让 refresh 每 100ms 背靠背拉起索引脚本。

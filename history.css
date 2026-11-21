@@ -21,6 +21,58 @@
   background: var(--l1);
 }
 
+/* 组内会话卡左缩进，视觉上归属上方的项目组头。 */
+.omp-history-card-indented {
+  padding-left: 20px;
+}
+
+/* 项目组头：项目名 + 会话数 + 折叠箭头。 */
+.omp-history-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: calc(1.6 * var(--sf-lh));
+  padding: calc(0.3 * var(--sf-lh)) 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--tv-fg, var(--t1));
+  text-align: left;
+}
+
+.omp-history-group:hover,
+.omp-history-group:focus-visible {
+  background: var(--l1);
+}
+
+.omp-history-chevron {
+  font-size: 0.8em;
+  color: var(--tv-fg-muted, var(--t2));
+  transition: transform 0.15s ease;
+}
+
+.omp-history-chevron-closed {
+  transform: rotate(-90deg);
+}
+
+.omp-history-group-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-weight: 600;
+  line-height: var(--sf-lh);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.omp-history-group-count {
+  flex: 0 0 auto;
+  color: var(--tv-fg-muted, var(--t2));
+  line-height: var(--sf-lh);
+}
+
 .omp-history-title,
 .omp-history-meta {
   height: var(--sf-lh);

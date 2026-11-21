@@ -11,7 +11,9 @@ import time
 import unittest
 
 
-TERN = shutil.which("tern")
+_tern_shim = shutil.which("tern")
+_tern_gui = Path(_tern_shim).with_name("tern.exe") if _tern_shim else None
+TERN = str(_tern_gui) if _tern_gui and _tern_gui.is_file() else _tern_shim
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -51,7 +53,7 @@ class SidebarCloseTest(unittest.TestCase):
         cls.addClassCleanup(cls.cleanup_window)
         subprocess.run(
             [TERN, "plugin", "link", str(PLUGIN_DIR)], cwd=workspace, env=cls.env,
-            check=True, capture_output=True, text=True, timeout=15,
+            check=True, capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         cls.window = subprocess.Popen(
             [TERN, "--control", cls.control], cwd=workspace, env=cls.env,
@@ -87,7 +89,7 @@ class SidebarCloseTest(unittest.TestCase):
         """向隔离窗口发送控制命令并读取结果。"""
         result = subprocess.run(
             [TERN, "ctl", "--control", cls.control, *args], cwd=cls.workspace,
-            env=cls.env, check=True, capture_output=True, text=True, timeout=15,
+            env=cls.env, check=True, capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         return json.loads(result.stdout)
 
@@ -96,7 +98,7 @@ class SidebarCloseTest(unittest.TestCase):
         """统计隔离会话中所有标签的历史面板。"""
         result = subprocess.run(
             [TERN, "ls", "--json"], cwd=cls.workspace, env=cls.env,
-            check=True, capture_output=True, text=True, timeout=15,
+            check=True, capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         sessions = json.loads(result.stdout)["sessions"]
         return sum(

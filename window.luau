@@ -22,6 +22,10 @@ local size_dirty = true
 local last_sig = {}
 -- 每个标签页里由本插件拉起的 omp 窗口，恢复新会话前先回收。
 local chat_panes = {}
+-- sidebar_tabs 里暂时没出现在宿主列表中的 pane，以及首次发现缺失的时间。
+-- canvas 刚 open 完、还没注册进 session 树时 tab_of/panes 都看不到它，
+-- 不能据此判定记录失效，否则去重落空会重复开窗。
+local missing_since = {}
 
 -- 转义传给终端 shell 的单个参数。
 -- POSIX 用 '\'' 折行单引号；Windows 的 PowerShell 不认这个序列，
@@ -202,7 +206,10 @@ end
 local function redraw(cx)
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
-			sidebar_tabs[canvas.pane] = cx.session:tab_of(canvas.pane)
+			local tab = cx.session:tab_of(canvas.pane)
+			-- tab_of 在面板刚创建、尚未注册时返回 nil；此时保留 open 时
+			-- 记下的旧值，否则去重凭据被抹掉，下一个 tick 会再开一个。
+			if tab then sidebar_tabs[canvas.pane] = tab end
 			local state = pane_state(canvas.pane)
 			local sig = content_sig(state)
 			if last_sig[canvas.pane] ~= sig then
@@ -301,6 +308,11 @@ local function ensure_sidebar(cx)
 				return
 			end
 		end
+	end
+	-- 最后查自己 open 时记下的映射：宿主列表同步有延迟，刚开的面板
+	-- 可能两边都还查不到，但记录已经在手，不能再开第二个。
+	for _, sidebar_tab in sidebar_tabs do
+		if sidebar_tab == tab then return end
 	end
 	opening = true
 	local main, dock = view()
@@ -505,15 +517,18 @@ local function tick(cx)
 	local seen_tab = {}
 	local pane_tab = {}
 	local tab_count = {}
+	local owned = {}
 	local closed_any = false
 	for _, info in ipairs(cx.session:panes()) do
 		pane_tab[info.pane] = info.tab
 		if info.tab then tab_count[info.tab] = (tab_count[info.tab] or 0) + 1 end
+		if info.program == "tern.canvas" and info.title == TITLE then owned[info.pane] = true end
 	end
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
+			owned[canvas.pane] = true
 			local tab = pane_tab[canvas.pane] or cx.session:tab_of(canvas.pane)
-			sidebar_tabs[canvas.pane] = tab
+			if tab then sidebar_tabs[canvas.pane] = tab end
 			if tab then
 				if seen_tab[tab] then
 					sidebar_tabs[canvas.pane] = nil
@@ -530,6 +545,22 @@ local function tick(cx)
 				last_sig[canvas.pane] = nil
 				cx.layout:close(canvas.pane)
 				closed_any = true
+			end
+		end
+	end
+	-- 校验记录：面板连续 5 秒不在宿主列表里才视为已死（比如 open
+	-- 失败留下的幽灵记录），否则只是同步延迟，先留着供去重使用。
+	local now_ms = tern.now()
+	for pane in sidebar_tabs do
+		if owned[pane] then
+			missing_since[pane] = nil
+		else
+			local since = missing_since[pane]
+			if not since then
+				missing_since[pane] = now_ms
+			elseif now_ms - since > 5000 then
+				sidebar_tabs[pane] = nil
+				missing_since[pane] = nil
 			end
 		end
 	end
@@ -561,6 +592,7 @@ tern.on("pane_closed", function(ev, cx)
 	sidebar_tabs[ev.pane] = nil
 	panes[ev.pane] = nil
 	last_sig[ev.pane] = nil
+	missing_since[ev.pane] = nil
 	for tab, pane in chat_panes do
 		if pane == ev.pane then chat_panes[tab] = nil end
 	end
@@ -596,6 +628,11 @@ every("boot", 100, function(cx)
 		initialize_visibility(cx)
 		ensure_toolbar_widget(cx)
 		refresh(cx)
+		-- 初始化完成即停：这里只是补跑 reload 后缺失的 window_start，
+		-- 不是轮询；继续挂着会让 refresh 每 100ms 背靠背拉起索引脚本。
+		local slot = timer_slots.boot
+		if slot and slot.handle then pcall(slot.handle.cancel, slot.handle) end
+		timer_slots.boot = nil
 	end
 end)
 every("tick", 1000, tick)

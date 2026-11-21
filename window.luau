@@ -1,30 +1,22 @@
 -- OMP 会话历史侧边栏：每个活动标签页使用一个原生画布面板。
 local TITLE = "OMP History"
-local DEFAULT_PAGE_SIZE = 8
-local tern_executable = tern.getenv("TERN_EXE")
-if not tern_executable or tern_executable == "" then
-	local app_executable = "/Applications/Tern.app/Contents/MacOS/tern"
-	tern_executable = if tern.runtime.os == "macos" and tern.fs.exists(app_executable) then app_executable else "tern"
-end
 local rows = {}
 local filtered = {}
 local query = ""
-local panes = {}
-local sidebar_tabs = {}
 local loading = false
-local sizing = false
-local next_size_check = 0
 local error_text = nil
 local opening = false
--- 尺寸改为事件驱动：只有分屏/关窗/切焦点才重新量一次。
-local size_dirty = true
--- 每个侧栏上次真正发出的签名，避免同一帧内容重复 set。
+-- 归档视图开关与归档会话集合（kv 持久化）。
+local view_archived = false
+local archived_sessions = {}
+-- 画布超节点会 set 失败：每卡约 10 节点、上限 2000，留余量截断。
+local MAX_VISIBLE_CARDS = 150
 local last_sig = {}
+local sidebar_tabs = {}
 -- 每个标签页里由本插件拉起的 omp 窗口，恢复新会话前先回收。
 local chat_panes = {}
 -- sidebar_tabs 里暂时没出现在宿主列表中的 pane，以及首次发现缺失的时间。
--- canvas 刚 open 完、还没注册进 session 树时 tab_of/panes 都看不到它，
--- 不能据此判定记录失效，否则去重落空会重复开窗。
+-- canvas 刚 open 完、还没注册进 session 树时宿主列表看不到它，先留着记录。
 local missing_since = {}
 
 -- 转义传给终端 shell 的单个参数。
@@ -57,25 +49,46 @@ local function every(name, ms, fn)
 	return slot
 end
 
--- 为每个侧边栏保留独立的页码与可见行数。
-local function pane_state(pane)
-	if not pane then return { page = 1, size = DEFAULT_PAGE_SIZE } end
-	if not panes[pane] then panes[pane] = { page = 1, size = DEFAULT_PAGE_SIZE } end
-	return panes[pane]
+-- 归档会话集合：kv 存 { [session_id] = true }。会话文件本体不动，
+-- --resume 不受影响；索引里已消失的 id 渲染时自然过滤，无残影。
+local function load_archived()
+	archived_sessions = {}
+	local saved = tern.kv.get("archived_sessions")
+	if type(saved) ~= "table" then return end
+	for id in saved do archived_sessions[tostring(id)] = true end
 end
 
--- 对搜索条件应用过滤，保留原始时间排序。
+local function save_archived()
+	local saved = {}
+	for id in archived_sessions do saved[id] = true end
+	tern.kv.set("archived_sessions", saved)
+end
+
+-- 对搜索条件应用过滤，保留原始时间排序。过滤集跟随当前视图：
+-- 主视图取未归档会话，归档视图取已归档会话。
 local function filter_rows()
 	filtered = {}
 	local needle = string.lower(query)
 	for _, row in rows do
-		-- 只剥控制字符；Nerd 图标是多字节 UTF-8，字节级 gsub 无法安全剥离，保留即可。
-		local clean_title = string.gsub(row.title or "", "[%c]+", " ")
-		local haystack = string.lower(clean_title .. " " .. (row.cwd or "") .. " " .. (row.id or "") .. " " .. (row.path or ""))
-		if needle == "" or string.find(haystack, needle, 1, true) then
-			table.insert(filtered, row)
+		local is_archived = archived_sessions[tostring(row.id or "")] == true
+		if is_archived == view_archived then
+			-- 只剥控制字符；Nerd 图标是多字节 UTF-8，字节级 gsub 无法安全剥离，保留即可。
+			local clean_title = string.gsub(row.title or "", "[%c]+", " ")
+			local haystack = string.lower(clean_title .. " " .. (row.cwd or "") .. " " .. (row.id or "") .. " " .. (row.path or ""))
+			if needle == "" or string.find(haystack, needle, 1, true) then
+				table.insert(filtered, row)
+			end
 		end
 	end
+end
+
+-- 已归档会话总数（与搜索词无关，用于工具栏徽标）。
+local function archived_count()
+	local n = 0
+	for _, row in rows do
+		if archived_sessions[tostring(row.id or "")] then n = n + 1 end
+	end
+	return n
 end
 
 -- 项目分组状态：按 cwd 全路径折叠。kv 持久化，跨插件重载保留。
@@ -126,7 +139,7 @@ local function build_groups()
 end
 
 -- 折叠视图下把组展开成“组头 + 会话卡”的渲染序列。返回 seq 中每项
--- { kind = "group"|"chat", group = group, row = row }，分页只数会话卡。
+-- { kind = "group"|"chat", group = group, row = row }。
 -- 折叠组的组头必须保留，否则没有可点击的入口重新展开。
 local function flatten_groups(groups)
 	local seq = {}
@@ -152,21 +165,12 @@ local function relative_time(ts)
 	return os.date("%m-%d", ts)
 end
 
--- 构建当前窗格的会话卡片和固定在底部的分页栏。
-local function view(pane)
+-- 构建当前视图的会话卡片和固定在底部的计数条。
+local function view()
 	local ui = tern.ui
-	local state = pane_state(pane)
-	local grouped = query == ""
-	-- 分页以“会话卡”为单位；分组模式下走渲染序列，平铺（搜索时）直接用 filtered。
+	-- 主视图按项目分组；归档视图平铺（归档是时间维度的事，不按项目分组）。
+	local grouped = query == "" and not view_archived
 	local total_cards = #filtered
-	local pages = math.max(1, math.ceil(total_cards / state.size))
-	local clamped = math.max(1, math.min(state.page, pages))
-	-- pane 为 nil 时 pane_state 返回临时表，clamp 结果不该只写在那张临时表上；
-	-- 有真实 pane 时同步回去，避免页码与渲染不一致导致多画一次。
-	if clamped ~= state.page then
-		state.page = clamped
-		if pane and panes[pane] then panes[pane].page = clamped end
-	end
 	local cards = {}
 	if error_text then
 		table.insert(cards, ui.card("读取失败", {
@@ -176,7 +180,11 @@ local function view(pane)
 	elseif loading and #rows == 0 then
 		table.insert(cards, ui.text("正在读取会话…"))
 	elseif total_cards == 0 then
-		if query == "" then
+		if view_archived then
+			table.insert(cards, ui.card("没有已归档的会话", {
+				ui.text("在主列表卡片上点归档按钮，会话会出现在这里"),
+			}, { tone = "muted", icon = "box-archive" }))
+		elseif query == "" then
 			table.insert(cards, ui.card("没有保存的会话", {
 				ui.text("运行一次 omp 后会自动出现在这里"),
 			}, { tone = "muted", icon = "history" }))
@@ -187,8 +195,6 @@ local function view(pane)
 			}, { tone = "muted", icon = "search" }))
 		end
 	end
-	local first = (state.page - 1) * state.size + 1
-	local last = math.min(state.page * state.size, total_cards)
 	local now = os.time()
 	-- 按日历日往前推一天：原来用 now - (小时+12)*3600 在凌晨会把前天算成昨天。
 	local today_t = os.date("*t", now)
@@ -198,7 +204,8 @@ local function view(pane)
 	})
 	local today = os.date("%Y-%m-%d", now)
 	local yesterday = os.date("%Y-%m-%d", yesterday_ts)
-	-- 构建会话卡片；day_label 参数避免循环里重复算日历日。
+	-- 构建会话卡片。归档/恢复按钮与卡片主体是同级兄弟节点：
+	-- 嵌进卡片里点击可能冒泡到卡片的 chat: action。
 	local function chat_card(row)
 		-- 索引来自外部脚本，字段可能缺失；逐个兜底，避免一行坏数据让整块侧栏崩掉。
 		local raw_title = tostring(row.title or "未命名会话")
@@ -211,7 +218,19 @@ local function view(pane)
 		local short_id = string.sub(row_id, 1, 8)
 		local rel = relative_time(updated)
 		local day_label = if day == today then "今天" elseif day == yesterday then "昨天" else os.date("%m-%d", updated)
-		return ui.el("button", {
+		local meta_children = {
+			ui.badge(rel, if day == today then "accent" else "muted"),
+			ui.el("span", { text = day_label }),
+			ui.el("span", { text = "·" }),
+			ui.el("span", { text = cwd }),
+			ui.el("span", { text = "·" }),
+			ui.el("span", { text = short_id }),
+		}
+		-- 归档视图补一个项目名 badge，方便辨认会话属于哪个项目。
+		if view_archived and raw_cwd ~= "" then
+			table.insert(meta_children, ui.el("span", { class = "omp-history-archived-badge", text = project_name(raw_cwd) }))
+		end
+		local card = ui.el("button", {
 			key = "chat_" .. row_id,
 			class = "omp-history-card" .. (if grouped then " omp-history-card-indented" else ""),
 			title = title .. "\n" .. raw_cwd .. "\n" .. row_id,
@@ -220,23 +239,26 @@ local function view(pane)
 			ui.el("div", { class = "omp-history-title", text = title }),
 			-- ui.node 不吃 class，必须用 ui.el div 承载 .omp-history-meta 的 flex 布局。
 			ui.el("div", { class = "omp-history-meta" }, {
-				ui.node("row", { gap = "xs" }, {
-					ui.badge(rel, if day == today then "accent" else "muted"),
-					ui.el("span", { text = day_label }),
-					ui.el("span", { text = "·" }),
-					ui.el("span", { text = cwd }),
-					ui.el("span", { text = "·" }),
-					ui.el("span", { text = short_id }),
-				}),
+				ui.node("row", { gap = "xs" }, meta_children),
 			}),
 		})
+		local action = if view_archived
+			then ui.el("button", {
+				key = "unarch_" .. row_id,
+				class = "omp-history-card-action",
+				title = "恢复到主列表",
+				actions = { click = "unarchive:" .. row_id },
+			}, { ui.el("span", { class = "sf", text = "󰁜" }) })
+			else ui.el("button", {
+				key = "arch_" .. row_id,
+				class = "omp-history-card-action",
+				title = "归档此会话",
+				actions = { click = "archive:" .. row_id },
+			}, { ui.el("span", { class = "sf", text = "󰆔" }) })
+		return ui.node("row", { gap = "xs", class = "omp-history-card-row" }, { card, action })
 	end
 	if grouped and total_cards > 0 then
-		local seq = flatten_groups(build_groups())
-		-- 卡片序号即分页游标：跳过序号不在 [first, last] 的卡片，组头总是
-		-- 插在它组内首个可见卡片之前，一组跨页时下一页顶部会重复组头。
-		local cursor = 0
-		for _, item in seq do
+		for _, item in flatten_groups(build_groups()) do
 			if item.kind == "group" then
 				local group = item.group
 				local collapsed = collapsed_projects[group.key] == true
@@ -252,27 +274,46 @@ local function view(pane)
 					ui.el("span", { class = "omp-history-group-count", text = tostring(#group.rows) }),
 				}))
 			else
-				cursor = cursor + 1
-				if cursor >= first and cursor <= last then
-					table.insert(cards, chat_card(item.row))
-				end
+				table.insert(cards, chat_card(item.row))
 			end
 		end
 	else
-		for i = first, last do
-			table.insert(cards, chat_card(filtered[i]))
+		for _, row in filtered do
+			table.insert(cards, chat_card(row))
 		end
 	end
-	local search_label = if query == "" then "搜索" else "搜索: " .. query
-	local toolbar
-	if query == "" then
-		toolbar = { ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
-			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }) }
-	else
-		toolbar = { ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }),
-			ui.button("重置", { icon = "x", title = "清除搜索词并显示全部会话", size = "sm", actions = { click = "search_reset" } }),
-			ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }) }
+	-- 防崩溃截断：画布节点超上限会让 canvas:set 永久失败。
+	-- 不是分页：正常使用到不了 150 张卡，只是兜底提示去搜索。
+	if #cards > MAX_VISIBLE_CARDS then
+		local shown = 0
+		for i, card in cards do
+			if i > MAX_VISIBLE_CARDS then break end
+			shown = shown + 1
+		end
+		local trimmed = {}
+		for i = 1, shown do trimmed[i] = cards[i] end
+		table.insert(trimmed, ui.el("div", {
+			class = "omp-history-truncated",
+			text = "还有 " .. (#cards - shown) .. " 个未显示，请用搜索缩小范围",
+		}))
+		cards = trimmed
 	end
+	local search_label = if query == "" then "搜索" else "搜索: " .. query
+	local toolbar = {}
+	-- 归档视图的入口/出口：主视图显示「归档 (n)」，归档视图显示「返回」。
+	if view_archived then
+		table.insert(toolbar, ui.button("返回", { icon = "arrow-left", title = "回到会话列表", size = "sm", actions = { click = "archive_view" } }))
+	else
+		local n = archived_count()
+		table.insert(toolbar, ui.button(if n > 0 then "归档 " .. n else "归档", {
+			icon = "box-archive", title = "查看已归档会话", size = "sm", actions = { click = "archive_view" },
+		}))
+	end
+	table.insert(toolbar, ui.button(search_label, { icon = "search", title = "搜索标题、目录或会话 ID", size = "sm", actions = { click = "search" } }))
+	if query ~= "" then
+		table.insert(toolbar, ui.button("重置", { icon = "x", title = "清除搜索词并显示全部会话", size = "sm", actions = { click = "search_reset" } }))
+	end
+	table.insert(toolbar, ui.button("刷新", { icon = "repeat", title = "立即刷新会话索引", size = "sm", actions = { click = "refresh" } }))
 	local main = ui.node("col", { gap = "sm" }, {
 		ui.el("div", { class = "omp-history-toolbar" }, {
 			ui.node("row", { gap = "sm", justify = "end" }, toolbar),
@@ -281,12 +322,10 @@ local function view(pane)
 	})
 	local dock = ui.node("col", { gap = "none" }, {
 		ui.el("div", { class = "omp-history-footer" }, {
-			ui.node("row", { gap = "xs" }, {
-				ui.button("", { icon = "arrow-left", title = "上一页", size = "sm", disabled = state.page == 1, actions = { click = "prev" } }),
-				ui.text(state.page .. " / " .. pages),
-				ui.button("", { icon = "arrow-right", title = "下一页", size = "sm", disabled = state.page == pages, actions = { click = "next" } }),
-			}),
-			ui.el("div", { class = "omp-history-count", text = if #filtered == 0 then "0 个会话" else ("第 " .. first .. "–" .. last .. " / 共 " .. #filtered .. " 个") }),
+			ui.el("div", { class = "omp-history-count", text = if view_archived
+				then "已归档 " .. total_cards .. " 个"
+				elseif total_cards == 0 then "0 个会话"
+				else "共 " .. total_cards .. " 个" }),
 		}),
 	})
 	return main, dock
@@ -295,15 +334,12 @@ end
 -- 将当前列表同步到插件拥有的所有侧边栏。
 -- 签名必须能吃出“可见内容”的变化：标题被 /rename 或索引刷新改写时，
 -- id 集合往往不变，只有 title/path/updated 变了，否则刷新按钮会静默失效。
-local function content_sig(state)
+local function content_sig()
 	local parts = {
 		tostring(#filtered), query, tostring(error_text), tostring(loading),
-		tostring(state.page), tostring(state.size),
+		tostring(view_archived),
 	}
-	local first = (state.page - 1) * state.size + 1
-	local last = math.min(state.page * state.size, #filtered)
-	for i = first, last do
-		local row = filtered[i]
+	for _, row in filtered do
 		parts[#parts + 1] = row.id
 		parts[#parts + 1] = row.title
 		parts[#parts + 1] = row.cwd
@@ -311,12 +347,14 @@ local function content_sig(state)
 	end
 	-- 分组模式额外吃出组序/组大小/折叠状态的变化，否则折叠点击和
 	-- 索引刷新导致的组序变化不会重绘。
-	if query == "" then
+	if query == "" and not view_archived then
 		for _, group in build_groups() do
 			parts[#parts + 1] = "g:" .. group.key .. ":" .. #group.rows .. ":" .. tostring(group.rows[1].updated)
 			parts[#parts + 1] = if collapsed_projects[group.key] then "c" else "o"
 		end
 	end
+	-- 工具栏徽标数字变化也要重绘。
+	parts[#parts + 1] = "a:" .. archived_count()
 	return table.concat(parts, "\1")
 end
 
@@ -327,10 +365,9 @@ local function redraw(cx)
 			-- tab_of 在面板刚创建、尚未注册时返回 nil；此时保留 open 时
 			-- 记下的旧值，否则去重凭据被抹掉，下一个 tick 会再开一个。
 			if tab then sidebar_tabs[canvas.pane] = tab end
-			local state = pane_state(canvas.pane)
-			local sig = content_sig(state)
+			local sig = content_sig()
 			if last_sig[canvas.pane] ~= sig then
-				local main, dock = view(canvas.pane)
+				local main, dock = view()
 				-- 超节点上限时 canvas:set 会抛错；只在成功后才记账，
 				-- 否则一次失败会让签名永久停留在“已发送”，后续内容变化不再重绘。
 				local ok = pcall(cx.canvas.set, cx.canvas, canvas.pane, { view = main, dock = dock })
@@ -338,42 +375,6 @@ local function redraw(cx)
 			end
 		end
 	end
-end
-
--- 从 Tern 的窗格网格高度计算每页数量，尺寸变化时保留当前首条会话。
-local function update_sizes(cx)
-	if sizing then return end
-	local owned = {}
-	for _, canvas in cx.canvas:list() do
-		if canvas.owner == tern.plugin.id and canvas.title == TITLE then owned[canvas.pane] = true end
-	end
-	if not next(owned) then return end
-	sizing = true
-	tern.process.run({ tern_executable, "ls", "--json" }, { timeout_ms = 5000 }, function(result, next_cx)
-		sizing = false
-		if not next_cx or result.status ~= 0 then return end
-		local ok, data = pcall(tern.json.decode, result.stdout)
-		if not ok or type(data) ~= "table" or type(data.sessions) ~= "table" then return end
-		local changed = false
-		for _, session in data.sessions do
-			for _, tab in session.tabs or {} do
-				for _, block in tab.blocks or {} do
-					if owned[block.id] and type(block.rows) == "number" and block.rows > 0 then
-						local state = pane_state(block.id)
-						-- 每张卡约 10 个节点，canvas 硬上限 2000 节点：300 行会直接超限。
-						local size = math.max(1, math.min(120, math.floor((block.rows - 5) / 3.4)))
-						if size ~= state.size then
-							local first = (state.page - 1) * state.size
-							state.page = math.floor(first / size) + 1
-							state.size = size
-							changed = true
-						end
-					end
-				end
-			end
-		end
-		if changed then redraw(next_cx) end
-	end)
 end
 
 -- 在后台读取索引，避免大目录扫描阻塞 Tern 窗口。
@@ -527,6 +528,8 @@ tern.on("canvas_action", function(ev, cx)
 	if ev.owner ~= tern.plugin.id then return nil end
 	local id = string.match(ev.act, "^chat:(.+)$")
 	local key = if not id then string.match(ev.act, "^group:(.+)$") else nil
+	local arch_id = if not id and not key then string.match(ev.act, "^archive:(.+)$") else nil
+	local unarch_id = if not id and not key and not arch_id then string.match(ev.act, "^unarchive:(.+)$") else nil
 	if id then
 		for _, row in rows do
 			if row.id == id then
@@ -542,7 +545,22 @@ tern.on("canvas_action", function(ev, cx)
 			collapsed_projects[key] = true
 		end
 		save_collapsed()
-		for _, state in panes do state.page = 1 end
+		redraw(cx)
+	elseif arch_id then
+		archived_sessions[arch_id] = true
+		save_archived()
+		-- 归档视图里如果正搜着被归档的会话，过滤集要跟着变。
+		filter_rows()
+		redraw(cx)
+	elseif unarch_id then
+		archived_sessions[unarch_id] = nil
+		save_archived()
+		filter_rows()
+		redraw(cx)
+	elseif ev.act == "archive_view" then
+		view_archived = not view_archived
+		query = ""
+		filter_rows()
 		redraw(cx)
 	elseif ev.act == "search" then
 		cx:prompt({ value = query, placeholder = "搜索标题、目录或会话 ID", action = "search" }):next(function(value, err, next_cx)
@@ -550,26 +568,16 @@ tern.on("canvas_action", function(ev, cx)
 			if err then next_cx:toast("error", "搜索失败", err) return end
 			if value ~= nil then
 				query = value
-				for _, state in panes do state.page = 1 end
 				filter_rows()
 				redraw(next_cx)
 			end
 		end)
 	elseif ev.act == "search_reset" then
 		query = ""
-		for _, state in panes do state.page = 1 end
 		filter_rows()
 		redraw(cx)
 	elseif ev.act == "refresh" then
 		refresh(cx)
-	elseif ev.act == "prev" then
-		local state = pane_state(ev.pane)
-		state.page = math.max(1, state.page - 1)
-		redraw(cx)
-	elseif ev.act == "next" then
-		local state = pane_state(ev.pane)
-		state.page = math.min(math.max(1, math.ceil(#filtered / state.size)), state.page + 1)
-		redraw(cx)
 	else
 		return nil
 	end
@@ -665,7 +673,6 @@ local function tick(cx)
 			if tab then
 				if seen_tab[tab] then
 					sidebar_tabs[canvas.pane] = nil
-					panes[canvas.pane] = nil
 					last_sig[canvas.pane] = nil
 					cx.layout:close(canvas.pane)
 					closed_any = true
@@ -699,19 +706,7 @@ local function tick(cx)
 	end
 	-- 刚关掉的这一 tick 别立刻重开，否则形成每秒开关环。
 	if not closed_any then ensure_sidebar(cx) end
-	if size_dirty and tern.now() >= next_size_check then
-		size_dirty = false
-		next_size_check = tern.now() + 8000
-		update_sizes(cx)
-	end
 end
-
--- 布局变化才需要重新量高度，不再靠每 2 秒轮询。
-local function mark_size_dirty() size_dirty = true end
-tern.on("pane_created", mark_size_dirty)
-tern.on("pane_closed", mark_size_dirty)
-tern.on("tab_created", mark_size_dirty)
-tern.on("focus", mark_size_dirty)
 
 -- 关闭整个标签时不改变其他标签的历史侧边栏显示状态。
 tern.on("tab_closed", function(ev)
@@ -723,7 +718,6 @@ end)
 tern.on("pane_closed", function(ev, cx)
 	local was_sidebar = sidebar_tabs[ev.pane] ~= nil
 	sidebar_tabs[ev.pane] = nil
-	panes[ev.pane] = nil
 	last_sig[ev.pane] = nil
 	missing_since[ev.pane] = nil
 	for tab, pane in chat_panes do
@@ -735,13 +729,10 @@ tern.on("pane_closed", function(ev, cx)
 end)
 
 -- 定期刷新历史，手动刷新和搜索不必等待定时器。
--- 用户正在搜索或已翻到后面的页时跳过：列表按 mtime 排序，后台写入会让
--- 卡片跳到前面，翻页时被打断更烦。
+-- 用户正在搜索或停在归档视图时跳过：列表按 mtime 排序，后台写入会让
+-- 卡片跳位，打断浏览。
 local function view_is_stable()
-	if query ~= "" then return false end
-	for _, state in panes do
-		if state.page > 1 then return false end
-	end
+	if query ~= "" or view_archived then return false end
 	return true
 end
 
@@ -753,6 +744,7 @@ tern.on("window_start", function(cx)
 	initialize_visibility(cx)
 	ensure_toolbar_widget(cx)
 	load_collapsed()
+	load_archived()
 	ensure_sidebar(cx)
 	refresh(cx)
 end)
@@ -762,6 +754,7 @@ every("boot", 100, function(cx)
 		initialize_visibility(cx)
 		ensure_toolbar_widget(cx)
 		load_collapsed()
+		load_archived()
 		refresh(cx)
 		-- 初始化完成即停：这里只是补跑 reload 后缺失的 window_start，
 		-- 不是轮询；继续挂着会让 refresh 每 100ms 背靠背拉起索引脚本。
@@ -781,5 +774,4 @@ tern.on("unload", function()
 	end
 	timer_slots = {}
 	loading = false
-	sizing = false
 end)

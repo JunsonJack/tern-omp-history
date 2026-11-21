@@ -16,6 +16,38 @@
   text-align: left;
 }
 
+/* 卡片行：会话卡 + 归档/恢复小按钮并排。 */
+.omp-history-card-row {
+  align-items: center;
+  min-width: 0;
+}
+
+.omp-history-card-row .omp-history-card {
+  flex: 1;
+}
+
+.omp-history-card-action {
+  flex-shrink: 0;
+  opacity: 0.55;
+  padding: 2px 4px;
+}
+
+.omp-history-card-action:hover {
+  opacity: 1;
+}
+
+/* 归档视图卡片里的项目名徽标。 */
+.omp-history-archived-badge {
+  flex-shrink: 0;
+  color: var(--t3);
+}
+
+/* 触顶截断提示。 */
+.omp-history-truncated {
+  color: var(--t3);
+  padding: 6px 8px;
+}
+
 .omp-history-card:hover,
 .omp-history-card:focus-visible {
   background: var(--l1);

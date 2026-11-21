@@ -197,5 +197,80 @@ class GroupCollapseTest(unittest.TestCase):
         self.assertEqual(self.card_count(), before, "再次点击组头应重新展开")
 
 
+@unittest.skipUnless(
+    TERN and os.environ.get("OMP_HISTORY_UI_TEST") == "1",
+    "需要 Tern 和 OMP_HISTORY_UI_TEST=1；测试会打开隔离窗口",
+)
+class ArchiveTest(unittest.TestCase):
+    """验证归档/恢复/归档视图。复用 SidebarCloseTest 的隔离窗口引导。
+
+    与 GroupCollapseTest 同理不继承：基类的 test_close_* 依赖
+    `tern ls --json` 在本机隔离环境必然失败。"""
+
+    ctl = SidebarCloseTest.__dict__["ctl"]
+    cleanup_window = SidebarCloseTest.__dict__["cleanup_window"]
+
+    @classmethod
+    def setUpClass(cls):
+        # 复用 SidebarCloseTest 的隔离窗口引导：取出底层函数以 cls=本类调用。
+        SidebarCloseTest.__dict__["setUpClass"].__func__(cls)
+        sessions_dir = Path(cls.temp.name) / "agent" / "sessions"
+        project_dir = Path(cls.temp.name) / "workspace" / "proj-alpha"
+        project_dir.mkdir(exist_ok=True)
+        session_dir = sessions_dir / "sess-00"
+        session_dir.mkdir()
+        (session_dir / "conv.jsonl").write_text(
+            "\n".join([
+                json.dumps({"type": "title", "title": "待归档会话"}),
+                json.dumps({"type": "session", "id": "aaaa1111aaaa1111", "cwd": str(project_dir)}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        cls.ctl("plugins", "run", "plugin.omp-history.toggle")
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if cls.card_count() >= 1:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("会话卡未在 40s 内渲染")
+
+    @classmethod
+    def card_count(cls):
+        return cls.ctl("tree", ".omp-history-card").get("count", 0)
+
+    @classmethod
+    def kv_path(cls):
+        return Path(cls.temp.name) / "config" / "plugin-data" / "omp-history" / "kv.json"
+
+    def test_archive_unarchive_and_view(self):
+        """点归档按钮移卡进归档视图；恢复按钮移回主列表；kv 持久化。"""
+        before = self.card_count()
+        self.assertEqual(before, 1, "主列表应有 1 张会话卡")
+
+        # 归档：卡片从主列表消失，id 写进 kv。
+        self.ctl("click", ".omp-history-card-action")
+        self.ctl("wait", "1000")
+        self.assertEqual(self.card_count(), 0, "归档后主列表应为空")
+        self.assertIn("aaaa1111", self.kv_path().read_text(encoding="utf-8"))
+
+        # 归档视图：出现返回按钮、卡片带项目名徽标、恢复按钮。
+        self.ctl("click", '[title="查看已归档会话"]')
+        self.ctl("wait", "1000")
+        self.assertEqual(self.card_count(), 1, "归档视图应有 1 张卡")
+        self.assertEqual(self.ctl("tree", ".omp-history-archived-badge").get("count"), 1, "归档卡应带项目名徽标")
+
+        # 恢复：回到主列表，kv 清空。
+        self.ctl("click", ".omp-history-card-action")
+        self.ctl("wait", "1000")
+        self.assertEqual(self.card_count(), 0, "恢复后归档视图应为空")
+        self.assertEqual(self.ctl("tree", '[title="查看已归档会话"]').get("count"), 0, "归档视图下应显示返回按钮而非归档入口")
+
+        self.ctl("click", '[title="回到会话列表"]')
+        self.ctl("wait", "1000")
+        self.assertEqual(self.card_count(), before, "恢复后主列表应回到原有卡片数")
+        self.assertNotIn("aaaa1111", self.kv_path().read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

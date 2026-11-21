@@ -218,13 +218,16 @@ local function view(pane)
 			actions = { click = "chat:" .. row_id },
 		}, {
 			ui.el("div", { class = "omp-history-title", text = title }),
-			ui.node("row", { gap = "xs", class = "omp-history-meta" }, {
-				ui.badge(rel, if day == today then "accent" else "muted"),
-				ui.el("span", { text = day_label }),
-				ui.el("span", { text = "·" }),
-				ui.el("span", { text = cwd }),
-				ui.el("span", { text = "·" }),
-				ui.el("span", { text = short_id }),
+			-- ui.node 不吃 class，必须用 ui.el div 承载 .omp-history-meta 的 flex 布局。
+			ui.el("div", { class = "omp-history-meta" }, {
+				ui.node("row", { gap = "xs" }, {
+					ui.badge(rel, if day == today then "accent" else "muted"),
+					ui.el("span", { text = day_label }),
+					ui.el("span", { text = "·" }),
+					ui.el("span", { text = cwd }),
+					ui.el("span", { text = "·" }),
+					ui.el("span", { text = short_id }),
+				}),
 			}),
 		})
 	end

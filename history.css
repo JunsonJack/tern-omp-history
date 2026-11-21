@@ -60,6 +60,7 @@
 
 .omp-history-group-name {
   flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   font-weight: 600;
   line-height: var(--sf-lh);
@@ -109,17 +110,31 @@
   text-align: right;
 }
 
-/* 会话卡片元信息行：徽标 + 日期 + 目录 + 短 ID。 */
+/* 会话卡片元信息行：徽标 + 日期 + 目录 + 短 ID。
+   ui.el div 是 flex 容器；内部 ui.node row 负责原生排布，被压缩时整行溢出隐藏。 */
 .omp-history-meta {
   display: flex !important;
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+  overflow: hidden;
 }
 
 .omp-history-meta span {
   overflow: hidden;
   text-overflow: ellipsis;
+  /* flex 子项默认 min-width:auto 不收缩，窄侧栏会溢出重叠；必须显式允许压缩。 */
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+/* 日期、分隔点、短 ID 很小，不参与压缩，目录名优先被截断。 */
+.omp-history-meta .sf-badge,
+.omp-history-meta > .sf-row span:nth-child(2),
+.omp-history-meta > .sf-row span:nth-child(3),
+.omp-history-meta > .sf-row span:nth-child(5),
+.omp-history-meta > .sf-row span:nth-child(6) {
+  flex-shrink: 0;
 }
 
 /* 小组件作为窗口工具栏入口，与原有按钮保持间距。 */

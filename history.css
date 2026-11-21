@@ -38,6 +38,12 @@
   opacity: 1;
 }
 
+/* 删除按钮：危险操作，悬停变红提示。 */
+.omp-history-card-delete:hover {
+  color: var(--error, #e5484d);
+  opacity: 1;
+}
+
 /* 归档视图卡片里的项目名徽标。 */
 .omp-history-archived-badge {
   flex-shrink: 0;

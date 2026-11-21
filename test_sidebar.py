@@ -272,5 +272,108 @@ class ArchiveTest(unittest.TestCase):
         self.assertNotIn("aaaa1111", self.kv_path().read_text(encoding="utf-8"))
 
 
+@unittest.skipUnless(
+    TERN and os.environ.get("OMP_HISTORY_UI_TEST") == "1",
+    "需要 Tern 和 OMP_HISTORY_UI_TEST=1；测试会打开隔离窗口",
+)
+class DeleteTest(unittest.TestCase):
+    """验证删除会话：确认弹窗、取消不动文件、确认后彻底删除。
+
+    与 GroupCollapseTest 同理不继承：基类的 test_close_* 依赖
+    `tern ls --json` 在本机隔离环境必然失败。"""
+
+    ctl = SidebarCloseTest.__dict__["ctl"]
+    cleanup_window = SidebarCloseTest.__dict__["cleanup_window"]
+
+    @classmethod
+    def setUpClass(cls):
+        # 复用 SidebarCloseTest 的隔离窗口引导：取出底层函数以 cls=本类调用。
+        SidebarCloseTest.__dict__["setUpClass"].__func__(cls)
+        sessions_dir = Path(cls.temp.name) / "agent" / "sessions"
+        project_dir = Path(cls.temp.name) / "workspace" / "proj-alpha"
+        project_dir.mkdir(exist_ok=True)
+        for name, title, sid in [
+            ("sess-00", "待删除会话", "aaaa1111aaaa1111"),
+            ("sess-01", "保留会话", "bbbb2222bbbb2222"),
+        ]:
+            session_dir = sessions_dir / name
+            session_dir.mkdir()
+            (session_dir / "conv.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"type": "title", "title": title}),
+                    json.dumps({"type": "session", "id": sid, "cwd": str(project_dir)}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+        cls.session_file = sessions_dir / "sess-00" / "conv.jsonl"
+        cls.sessions_dir = sessions_dir
+        # 排序修正：'.omp-history-card-delete' 只匹配第一张卡，而列表按最新在前渲染。
+        # 把待删除会话的 mtime 提到最新，保证它是第一张卡。
+        os.utime(cls.session_file, (time.time() + 60, time.time() + 60))
+        cls.ctl("plugins", "run", "plugin.omp-history.toggle")
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if cls.card_count() >= 2:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("会话卡未在 40s 内渲染")
+
+    @classmethod
+    def card_count(cls):
+        return cls.ctl("tree", ".omp-history-card").get("count", 0)
+
+    def test_delete_confirm_and_cancel(self):
+        """删除按钮弹确认；取消保留文件；确认后文件被删、卡片消失。"""
+        self.assertEqual(self.card_count(), 2, "主列表应有 2 张会话卡")
+
+        # 待删除会话经 setUpClass 的 utime 排在第一张，'.omp-history-card-delete' 即其按钮。
+        # 点删除 → 确认弹窗出现，ck-item 文本应含目标标题（label+detail 合并文本）。
+        self.ctl("click", ".omp-history-card-delete")
+        deadline = time.monotonic() + 10
+        confirm_center = None
+        while time.monotonic() < deadline:
+            pick = self.ctl("tree", ".ck-item")
+            nodes = pick.get("nodes") or []
+            texts = [(n.get("text") or "") for n in nodes]
+            if nodes and any("待删除会话" in t for t in texts):
+                r = nodes[0].get("rect")
+                if r:
+                    confirm_center = (r[0] + r[2] / 2, r[1] + r[3] / 2)
+                    break
+            time.sleep(0.3)
+        self.assertIsNotNone(confirm_center, "确认弹窗未在 10s 内指向待删除会话")
+        self.ctl("click", str(int(confirm_center[0])), str(int(confirm_center[1])))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not self.session_file.exists():
+                break
+            time.sleep(0.3)
+        else:
+            self.fail("确认后 10s 内会话文件仍未被删除")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.card_count() == 1:
+                break
+            time.sleep(0.3)
+        else:
+            self.fail("删除后卡片数未降到 1")
+
+        # 取消路径单独验证：对剩下的"保留会话"点删除并 Esc，文件必须还在。
+        self.ctl("click", ".omp-history-card-delete")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.ctl("tree", ".ck-item").get("count", 0) >= 1:
+                break
+            time.sleep(0.3)
+        self.ctl("key", "Escape")
+        self.ctl("wait", "800")
+        self.assertTrue((self.sessions_dir / "sess-01" / "conv.jsonl").exists(), "取消后保留会话文件不应被删除")
+
+        # kv 里不应残留该会话的归档记录。
+        kv = Path(self.temp.name) / "config" / "plugin-data" / "omp-history" / "kv.json"
+        self.assertNotIn("aaaa1111", kv.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

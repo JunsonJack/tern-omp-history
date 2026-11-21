@@ -242,6 +242,12 @@ local function view()
 				ui.node("row", { gap = "xs" }, meta_children),
 			}),
 		})
+		local del = ui.el("button", {
+			key = "del_" .. row_id,
+			class = "omp-history-card-action omp-history-card-delete",
+			title = "彻底删除此会话文件",
+			actions = { click = "del:" .. row_id },
+		}, { ui.el("span", { class = "sf", text = "󰆴" }) })
 		local action = if view_archived
 			then ui.el("button", {
 				key = "unarch_" .. row_id,
@@ -255,7 +261,7 @@ local function view()
 				title = "归档此会话",
 				actions = { click = "archive:" .. row_id },
 			}, { ui.el("span", { class = "sf", text = "󰆔" }) })
-		return ui.node("row", { gap = "xs", class = "omp-history-card-row" }, { card, action })
+		return ui.node("row", { gap = "xs", class = "omp-history-card-row" }, { card, action, del })
 	end
 	if grouped and total_cards > 0 then
 		for _, item in flatten_groups(build_groups()) do
@@ -492,6 +498,55 @@ local function ensure_toolbar_widget(cx)
 	if ok then tern.kv.set("widget_added", true) end
 end
 
+-- 删除会话前经 cx:pick 确认；确认后彻底删除会话 jsonl 文件并刷新索引。
+-- pick resolves 传入的原表（可带自定义字段），nil = 用户取消或被别的弹窗顶掉。
+local function confirm_delete(cx, row)
+	local row_id = tostring(row.id or "")
+	local title = string.gsub(tostring(row.title or "未命名会话"), "[%c]+", " ")
+	local path = tostring(row.path or "")
+	if path == "" then
+		cx:toast("error", "无法删除会话", "索引里没有该会话的文件路径")
+		return
+	end
+	cx:pick({
+		placeholder = "删除会话：" .. title,
+		icon = "trash",
+		action = "删除",
+		items = {
+			{ label = "彻底删除", detail = title, icon = "trash", act = "confirm", path = path, id = row_id },
+			{ label = "取消", icon = "x", act = "cancel" },
+		},
+	}):next(function(item, err, next_cx)
+		if not next_cx then return end
+		if err then next_cx:toast("error", "删除确认失败", err) return end
+		if not item or item.act ~= "confirm" then
+			next_cx:toast("info", "已取消删除", title)
+			return
+		end
+		-- Tern 的 Luau VM 没有 os 库。用 tern.process.run 回调式起进程删除（无 shell，argv 直传）：
+		-- 回调拿 (result, cb_cx)，spawn 失败在调用处 raise，pcall 兜住转 toast。
+		local argv = if tern.runtime and tern.runtime.os == "windows"
+			then { "cmd.exe", "/c", "del", "/f", "/q", item.path }
+			else { "rm", "-f", item.path }
+		local spawn_ok, run_err = pcall(tern.process.run, argv, { timeout_ms = 5000 }, function(result, cb_cx)
+			if not cb_cx then return end
+			if not result or result.status ~= 0 then
+				local detail = result and (result.stderr ~= "" and result.stderr or result.stdout) or "进程启动失败"
+				cb_cx:toast("error", "删除会话失败", detail)
+				return
+			end
+			-- 会话没了，归档记录与折叠记录里的残留键一并清掉，避免 kv 无限膨胀。
+			archived_sessions[item.id] = nil
+			save_archived()
+			cb_cx:toast("success", "会话已删除", title)
+			refresh(cb_cx)
+		end)
+		if not spawn_ok then
+			next_cx:toast("error", "删除会话失败", tostring(run_err))
+		end
+	end)
+end
+
 -- 找到当前标签最右侧的实际内容窗格，避免把侧边栏再次拆开。
 local function rightmost(tree, sidebar)
 	if not tree then return nil end
@@ -557,6 +612,14 @@ tern.on("canvas_action", function(ev, cx)
 		save_archived()
 		filter_rows()
 		redraw(cx)
+	elseif string.match(ev.act, "^del:(.+)$") then
+		local del_id = string.match(ev.act, "^del:(.+)$")
+		for _, row in rows do
+			if row.id == del_id then
+				confirm_delete(cx, row)
+				break
+			end
+		end
 	elseif ev.act == "archive_view" then
 		view_archived = not view_archived
 		query = ""

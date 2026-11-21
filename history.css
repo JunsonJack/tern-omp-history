@@ -1,5 +1,7 @@
 .omp-history-list {
   min-width: 0;
+  /* 面板滚动条（tv-bar）约 14px 宽，画在列表右缘之上；给内容留出通道，避免归档按钮被滚动条压住。 */
+  padding-right: 16px;
 }
 
 .omp-history-card {

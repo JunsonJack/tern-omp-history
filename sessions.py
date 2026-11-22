@@ -7,15 +7,14 @@ from pathlib import Path
 import sys
 
 
-def last_appended_title(path, current):
-    """回读文件尾部，取最后一条 title 记录（omp 改名会追加带 previousTitle 的行）。"""
+def last_appended_title(stream, current):
+    """在同一已打开句柄上回读文件尾部，取最后一条 title 记录（omp 改名会追加带 previousTitle 的行）。"""
     try:
-        with path.open("rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            size = stream.tell()
-            window = min(size, 64 * 1024)
-            stream.seek(size - window)
-            chunk = stream.read(window)
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        window = min(size, 64 * 1024)
+        stream.seek(size - window)
+        chunk = stream.read(window)
     except OSError:
         return current
     lines = chunk.split(b"\n")
@@ -81,9 +80,9 @@ def main():
                         cwd = entry.get("cwd") or ""
                         session_id = entry.get("id") or ""
                         break
-                # 首行不是 title 且追加记录在文件尾时，回读最后 64KB 找最新 title。
+                # 首行不是 title 且追加记录在文件尾时，在同一句柄上回读最后 64KB 找最新 title。
                 if session_id:
-                    title = last_appended_title(path, title)
+                    title = last_appended_title(stream, title)
             if not session_id:
                 continue
             rows.append({"id": session_id, "title": title or "未命名会话", "cwd": cwd,

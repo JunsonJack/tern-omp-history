@@ -18,15 +18,42 @@ local chat_panes = {}
 -- sidebar_tabs 里暂时没出现在宿主列表中的 pane，以及首次发现缺失的时间。
 -- canvas 刚 open 完、还没注册进 session 树时宿主列表看不到它，先留着记录。
 local missing_since = {}
+-- 已探明的可用 python 命令；记住后避免每次 refresh 都先 spawn 一次失败的 python。
+local python_cmd = nil
 
--- 转义传给终端 shell 的单个参数。
--- POSIX 用 '\'' 折行单引号；Windows 的 PowerShell 不认这个序列，
--- 单引号里两个连续单引号才是转义，所以按平台分别处理。
-local function shell_quote(value)
-	if tern.runtime.os == "windows" then
+-- 转义传给终端 shell 的单个参数。Tern 的窗格 shell 取自用户的登录 shell
+-- （Windows 上可能是 PowerShell 或 cmd.exe，POSIX 上是 bash/zsh/fish），
+-- 不能只按操作系统判断：这里从实际承载恢复会话的窗格读取 program 再决定。
+-- 参数本身是 OMP 会话文件路径，不含换行，按单引号 / 双引号规则分别处理。
+local function shell_quote(value, shell)
+	local name = string.lower(tostring(shell or ""))
+	local powershell = string.find(name, "powershell", 1, true) or string.find(name, "pwsh", 1, true)
+	if powershell then
+		-- PowerShell：单引号内两个连续单引号表示一个单引号。
 		return "'" .. string.gsub(value, "'", "''") .. "'"
 	end
+	if string.find(name, "cmd", 1, true) then
+		-- cmd.exe：只认双引号；路径里不含双引号，直接包住即可。
+		return '"' .. value .. '"'
+	end
+	-- POSIX shell：单引号内用 '\'' 折行插入一个单引号。
 	return "'" .. string.gsub(value, "'", "'\\''") .. "'"
+end
+
+-- 判断窗格使用的 shell：优先取实际目标窗格的 program，其次当前聚焦窗格，
+-- 都没有时退回按操作系统猜测（cmd.exe 是 Windows 上唯一需要双引号的分支）。
+local function shell_for_pane(cx, pane)
+	local programs = {}
+	for _, p in ipairs(cx.session:panes()) do
+		programs[p.pane] = p.program
+	end
+	local program = pane and programs[pane] or nil
+	if not program then
+		local focused = cx.session:focused()
+		program = focused and programs[focused] or nil
+	end
+	if not program and tern.runtime.os == "windows" then return "cmd.exe" end
+	return program or ""
 end
 
 -- 活着的 timer 句柄：递归 timer 每次触发都会产生新句柄，
@@ -64,10 +91,22 @@ local function save_archived()
 	tern.kv.set("archived_sessions", saved)
 end
 
+-- build_groups 的失效式缓存：输入只可能是 rows/filtered/archived/collapsed，
+-- 任何一处变动都走下面对应的失效函数，避免 redraw×canvas、content_sig、view
+-- 在一轮里把同样的分组排序算上好几遍。
+-- 注意：必须声明在 filter_rows 之前（Luau 词法作用域，local 函数先声明才可见）。
+local groups_cache = nil
+
+local function invalidate_groups()
+	groups_cache = nil
+end
+
 -- 对搜索条件应用过滤，保留原始时间排序。过滤集跟随当前视图：
 -- 主视图取未归档会话，归档视图取已归档会话。
 local function filter_rows()
 	filtered = {}
+	-- filtered 是 build_groups 的输入，重过滤后旧分组必须作废。
+	invalidate_groups()
 	local needle = string.lower(query)
 	for _, row in rows do
 		local is_archived = archived_sessions[tostring(row.id or "")] == true
@@ -96,6 +135,7 @@ local collapsed_projects = {}
 
 local function load_collapsed()
 	collapsed_projects = {}
+	invalidate_groups()
 	local saved = tern.kv.get("collapsed_projects")
 	if type(saved) ~= "table" then return end
 	for key in saved do collapsed_projects[key] = true end
@@ -107,6 +147,13 @@ local function save_collapsed()
 	tern.kv.set("collapsed_projects", saved)
 end
 
+-- kv 跨 VM 共享，但 Lua 表只在启动时读一次；另一个窗口改了归档/折叠状态时
+-- 本窗口的视图会一直是旧的。每次刷新索引前重读这两个集合，保证多窗口一致。
+local function sync_state_from_kv()
+	load_archived()
+	load_collapsed()
+end
+
 local function project_name(cwd)
 	if cwd == "" then return "未知目录" end
 	return string.match(cwd, "([^/\\]+)[/\\]?$") or cwd
@@ -116,6 +163,7 @@ end
 -- 最近活跃的项目在最上面。空 cwd 归入 "" 组沉底。
 -- rows 本身已按 updated 降序，组内顺序直接沿用；组间用首条（最新）比较。
 local function build_groups()
+	if groups_cache then return groups_cache end
 	local order = {}
 	local groups = {}
 	for _, row in filtered do
@@ -135,6 +183,7 @@ local function build_groups()
 		if a_empty ~= b_empty then return b_empty end
 		return a.rows[1].updated > b.rows[1].updated
 	end)
+	groups_cache = order
 	return order
 end
 
@@ -211,7 +260,8 @@ local function view()
 		local raw_title = tostring(row.title or "未命名会话")
 		local title = string.gsub(raw_title, "[%c]+", " ")
 		local raw_cwd = tostring(row.cwd or "")
-		local cwd = if raw_cwd ~= "" then (string.match(raw_cwd, "([^/]+)$") or string.match(raw_cwd, "([^\\]+)$") or raw_cwd) else "未知目录"
+		-- 目录名统一走 project_name：与组头同一实现，还能剥掉尾部分隔符。
+		local cwd = project_name(raw_cwd)
 		local updated = tonumber(row.updated) or 0
 		local row_id = tostring(row.id or "")
 		local day = os.date("%Y-%m-%d", updated)
@@ -365,15 +415,17 @@ local function content_sig()
 end
 
 local function redraw(cx)
+	-- 签名对本轮所有 canvas 相同，提到循环外只算一次；命中重绘时视图也一样。
+	local sig = content_sig()
+	local main, dock
 	for _, canvas in cx.canvas:list() do
 		if canvas.owner == tern.plugin.id and canvas.title == TITLE then
 			local tab = cx.session:tab_of(canvas.pane)
 			-- tab_of 在面板刚创建、尚未注册时返回 nil；此时保留 open 时
 			-- 记下的旧值，否则去重凭据被抹掉，下一个 tick 会再开一个。
 			if tab then sidebar_tabs[canvas.pane] = tab end
-			local sig = content_sig()
 			if last_sig[canvas.pane] ~= sig then
-				local main, dock = view()
+				if not main then main, dock = view() end
 				-- 超节点上限时 canvas:set 会抛错；只在成功后才记账，
 				-- 否则一次失败会让签名永久停留在“已发送”，后续内容变化不再重绘。
 				local ok = pcall(cx.canvas.set, cx.canvas, canvas.pane, { view = main, dock = dock })
@@ -387,23 +439,45 @@ end
 local function refresh(cx)
 	if loading then return end
 	loading = true
-	tern.process.run({ "python", tern.plugin.dir .. "/sessions.py" }, { timeout_ms = 30000 }, function(result, next_cx)
-		loading = false
-		if not next_cx then return end
-		if result.status ~= 0 then
-			error_text = if result.stderr ~= "" then result.stderr else "索引程序运行失败"
-		else
-			local ok, data = pcall(tern.json.decode, result.stdout)
-			if ok and type(data) == "table" then
-				rows = data
-				error_text = nil
-				filter_rows()
-			else
-				error_text = "索引结果无效"
+	-- 重读归档/折叠状态，吸收其他窗口通过 kv 提交的改动；立即重过滤，
+	-- 即使索引加载失败也让当前视图反映最新的归档状态。
+	sync_state_from_kv()
+	filter_rows()
+	-- 首选 python，spawn 失败（如 macOS/Linux 只有 python3）再试 python3；
+	-- 已知可用解释器后记住它，避免每次 refresh 都先付一次失败的 spawn。
+	local attempts = if python_cmd then { python_cmd } else { "python", "python3" }
+	local function run_index()
+		for i, cmd in attempts do
+			local spawned, result_or_err = pcall(tern.process.run, { cmd, tern.plugin.dir .. "/sessions.py" }, { timeout_ms = 30000 }, function(result, next_cx)
+				loading = false
+				if not next_cx then return end
+				if result.status ~= 0 then
+					error_text = if result.stderr ~= "" then result.stderr else "索引程序运行失败"
+				else
+					python_cmd = cmd
+					local ok, data = pcall(tern.json.decode, result.stdout)
+					if ok and type(data) == "table" then
+						rows = data
+						error_text = nil
+						filter_rows()
+					else
+						error_text = "索引结果无效"
+					end
+				end
+				redraw(next_cx)
+			end)
+			-- spawn 抛错：命令不存在。还有候选就试下一个。
+			if spawned then return end
+			if i == #attempts then
+				loading = false
+				-- spawn 失败抛的是字符串，直接附上它；python 与 python3 都找不到时
+				-- 两处错误都能看到，而不是只显示最后一个命令名。
+				error_text = "未找到 Python（" .. tostring(result_or_err) .. "），请安装 Python 并确认在 PATH 中"
+				if cx then redraw(cx) end
 			end
 		end
-		redraw(next_cx)
-	end)
+	end
+	run_index()
 end
 
 -- 为当前标签页挂载侧边栏，已有面板时保留现有布局。
@@ -498,7 +572,7 @@ local function ensure_toolbar_widget(cx)
 	if ok then tern.kv.set("widget_added", true) end
 end
 
--- 删除会话前经 cx:pick 确认；确认后彻底删除会话 jsonl 文件并刷新索引。
+-- 删除会话前经 cx:pick 确认；确认后彻底删除会话目录并刷新索引。
 -- pick resolves 传入的原表（可带自定义字段），nil = 用户取消或被别的弹窗顶掉。
 local function confirm_delete(cx, row)
 	local row_id = tostring(row.id or "")
@@ -508,12 +582,16 @@ local function confirm_delete(cx, row)
 		cx:toast("error", "无法删除会话", "索引里没有该会话的文件路径")
 		return
 	end
+	-- 会话目录 = jsonl 所在目录；删除目标是整个目录（README 同此口径）。
+	-- 目录里是否有别的文件决定了删整目录还是只删 jsonl；探测放在确认之后，
+	-- 避免弹窗期间目录变化导致用陈旧判断删错目标（TOCTOU）。
+	local dir = string.match(path, "^(.*)[/\\][^/\\]+$") or path
 	cx:pick({
 		placeholder = "删除会话：" .. title,
 		icon = "trash",
 		action = "删除",
 		items = {
-			{ label = "彻底删除", detail = title, icon = "trash", act = "confirm", path = path, id = row_id },
+			{ label = "彻底删除", detail = title, icon = "trash", act = "confirm", path = path, dir = dir, id = row_id },
 			{ label = "取消", icon = "x", act = "cancel" },
 		},
 	}):next(function(item, err, next_cx)
@@ -523,27 +601,35 @@ local function confirm_delete(cx, row)
 			next_cx:toast("info", "已取消删除", title)
 			return
 		end
-		-- Tern 的 Luau VM 没有 os 库。用 tern.process.run 回调式起进程删除（无 shell，argv 直传）：
-		-- 回调拿 (result, cb_cx)，spawn 失败在调用处 raise，pcall 兜住转 toast。
-		local argv = if tern.runtime and tern.runtime.os == "windows"
-			then { "cmd.exe", "/c", "del", "/f", "/q", item.path }
-			else { "rm", "-f", item.path }
-		local spawn_ok, run_err = pcall(tern.process.run, argv, { timeout_ms = 5000 }, function(result, cb_cx)
-			if not cb_cx then return end
-			if not result or result.status ~= 0 then
-				local detail = result and (result.stderr ~= "" and result.stderr or result.stdout) or "进程启动失败"
-				cb_cx:toast("error", "删除会话失败", detail)
-				return
+		-- 直接用 Tern 提供的同步文件 API 删除：跨平台，无 shell，
+		-- 路径里的空格与 & | ^ 等字符不会被 shell 误解析，也没有注入面。
+		-- 旧实现走 cmd.exe /c del 或 rm，路径含空格会失败且存在命令注入风险。
+		-- 确认时重新探测目录：独占目录删整目录（连带 omp 附属文件），
+		-- 目录里有别的文件时只删 jsonl。
+		local shared_dir = false
+		do
+			local ok, entries = pcall(tern.fs.list, dir)
+			if ok and type(entries) == "table" then
+				for _, name in entries do
+					if dir .. "/" .. name ~= path and dir .. "\\" .. name ~= path then
+						shared_dir = true
+						break
+					end
+				end
 			end
-			-- 会话没了，归档记录与折叠记录里的残留键一并清掉，避免 kv 无限膨胀。
-			archived_sessions[item.id] = nil
-			save_archived()
-			cb_cx:toast("success", "会话已删除", title)
-			refresh(cb_cx)
-		end)
-		if not spawn_ok then
-			next_cx:toast("error", "删除会话失败", tostring(run_err))
 		end
+		local target = if shared_dir then path else dir
+		local removed, remove_err = pcall(tern.fs.remove, target)
+		if not removed then
+			next_cx:toast("error", "删除会话失败", tostring(remove_err))
+			return
+		end
+		-- 会话没了，归档记录里的残留键一并清掉，避免 kv 无限膨胀
+		-- （折叠键按 cwd 记录，与单个会话无关，不需要清理）。
+		archived_sessions[item.id] = nil
+		save_archived()
+		next_cx:toast("success", "会话已删除", title)
+		refresh(next_cx)
 	end)
 end
 
@@ -565,12 +651,12 @@ local function open_chat(cx, row, sidebar)
 		pcall(cx.layout.close, cx.layout, chat_panes[tab])
 		chat_panes[tab] = nil
 	end
-	local launch = { command = "omp --resume " .. shell_quote(row.path) }
-	if row.cwd ~= "" then launch.cwd = row.cwd end
 	if not target then
 		cx:toast("error", "无法恢复会话", row.title)
 		return
 	end
+	local launch = { command = "omp --resume " .. shell_quote(row.path, shell_for_pane(cx, target)) }
+	if row.cwd ~= "" then launch.cwd = row.cwd end
 	local opened = cx.layout:split(target, "right", launch)
 	if not opened then
 		cx:toast("error", "无法恢复会话", row.title)
@@ -630,7 +716,8 @@ tern.on("canvas_action", function(ev, cx)
 			if not next_cx then return end
 			if err then next_cx:toast("error", "搜索失败", err) return end
 			if value ~= nil then
-				query = value
+				-- 首尾空白会让精确匹配搜不到任何结果，先剥掉。
+				query = string.match(value, "^%s*(.-)%s*$") or value
 				filter_rows()
 				redraw(next_cx)
 			end

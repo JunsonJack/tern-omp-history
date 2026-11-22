@@ -293,7 +293,8 @@ class DeleteTest(unittest.TestCase):
         project_dir = Path(cls.temp.name) / "workspace" / "proj-alpha"
         project_dir.mkdir(exist_ok=True)
         for name, title, sid in [
-            ("sess-00", "待删除会话", "aaaa1111aaaa1111"),
+            # 目录名含空格：旧实现走 cmd.exe /c del 未加引号，会在这里失败。
+            ("sess 00 with spaces", "待删除会话", "aaaa1111aaaa1111"),
             ("sess-01", "保留会话", "bbbb2222bbbb2222"),
         ]:
             session_dir = sessions_dir / name
@@ -305,7 +306,7 @@ class DeleteTest(unittest.TestCase):
                 ]) + "\n",
                 encoding="utf-8",
             )
-        cls.session_file = sessions_dir / "sess-00" / "conv.jsonl"
+        cls.session_file = sessions_dir / "sess 00 with spaces" / "conv.jsonl"
         cls.sessions_dir = sessions_dir
         # 排序修正：'.omp-history-card-delete' 只匹配第一张卡，而列表按最新在前渲染。
         # 把待删除会话的 mtime 提到最新，保证它是第一张卡。
@@ -346,11 +347,12 @@ class DeleteTest(unittest.TestCase):
         self.ctl("click", str(int(confirm_center[0])), str(int(confirm_center[1])))
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if not self.session_file.exists():
+            # 删除目标是整个会话目录；目录独占时应连带目录一起消失。
+            if not self.session_file.exists() and not self.session_file.parent.exists():
                 break
             time.sleep(0.3)
         else:
-            self.fail("确认后 10s 内会话文件仍未被删除")
+            self.fail("确认后 10s 内会话目录仍未被删除")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.card_count() == 1:
@@ -369,6 +371,7 @@ class DeleteTest(unittest.TestCase):
         self.ctl("key", "Escape")
         self.ctl("wait", "800")
         self.assertTrue((self.sessions_dir / "sess-01" / "conv.jsonl").exists(), "取消后保留会话文件不应被删除")
+        self.assertTrue((self.sessions_dir / "sess-01").is_dir(), "取消后保留会话目录不应被删除")
 
         # kv 里不应残留该会话的归档记录。
         kv = Path(self.temp.name) / "config" / "plugin-data" / "omp-history" / "kv.json"
